@@ -19,6 +19,10 @@ struct ChannelState {
     analysis: AnalysisEngine,
     detector: Detector,
     bands: BandProcessor,
+    /// Delays the dry signal by one analysis window so the gain reduction
+    /// computed from a block of audio is applied to *that same block*. This
+    /// makes the plugin's reported latency (one FFT window) genuine.
+    delay: DelayLine,
 }
 
 impl ChannelState {
@@ -28,12 +32,49 @@ impl ChannelState {
             analysis: AnalysisEngine::new(fft_size, sample_rate),
             detector: Detector::new(fft_size, sample_rate),
             bands: BandProcessor::new(layout, sample_rate),
+            delay: DelayLine::new(fft_size),
         }
     }
 
     fn reset(&mut self) {
         self.detector.reset();
         self.bands.reset();
+        self.delay.reset();
+    }
+}
+
+/// Fixed-capacity circular delay line. `push_pop(x)` returns the sample that
+/// was fed in `len` calls ago; `len` is fixed at construction so the audio
+/// thread never (re)allocates. Used for look-ahead latency equal to one
+/// analysis window.
+struct DelayLine {
+    buf: Vec<f32>,
+    pos: usize,
+    len: usize,
+}
+
+impl DelayLine {
+    fn new(len: usize) -> Self {
+        let len = len.max(1);
+        Self {
+            buf: vec![0.0; len],
+            pos: 0,
+            len,
+        }
+    }
+
+    #[inline]
+    fn push_pop(&mut self, x: f32) -> f32 {
+        let read = (self.pos + self.buf.len() - self.len) % self.buf.len();
+        let out = self.buf[read];
+        self.buf[self.pos] = x;
+        self.pos = (self.pos + 1) % self.buf.len();
+        out
+    }
+
+    fn reset(&mut self) {
+        self.buf.fill(0.0);
+        self.pos = 0;
     }
 }
 
@@ -132,13 +173,16 @@ impl ResonanceSuppressor {
     }
 
     /// Process a single stereo sample pair, returning (left, right).
+    ///
+    /// Both the dry and wet paths are delayed by one analysis window per
+    /// channel (see `ChannelState::delay`), so the reported latency is real.
     pub fn process_sample(&mut self, left: f32, right: f32) -> (f32, f32) {
         let idx = self.fft_index;
         let params = self.detect_params;
 
-        let (wet_l, frame_l) =
+        let (wet_l, dry_l, frame_l) =
             Self::process_channel(&mut self.channels[0], idx, left, params, self.sample_rate);
-        let (wet_r, _frame_r) =
+        let (wet_r, dry_r, _frame_r) =
             Self::process_channel(&mut self.channels[1], idx, right, params, self.sample_rate);
 
         if let (Some((levels, gains)), Some(producer)) = (frame_l, self.viz_producer.as_mut()) {
@@ -151,8 +195,8 @@ impl ResonanceSuppressor {
             });
         }
 
-        let out_l = apply_io(left, wet_l, self.mix, self.delta_mode);
-        let out_r = apply_io(right, wet_r, self.mix, self.delta_mode);
+        let out_l = apply_io(dry_l, wet_l, self.mix, self.delta_mode);
+        let out_r = apply_io(dry_r, wet_r, self.mix, self.delta_mode);
         (out_l, out_r)
     }
 
@@ -163,7 +207,7 @@ impl ResonanceSuppressor {
         x: f32,
         params: DetectParams,
         _sample_rate: f32,
-    ) -> (f32, Option<([f32; BANDS], [f32; BANDS])>) {
+    ) -> (f32, f32, Option<([f32; BANDS], [f32; BANDS])>) {
         let st = &mut ch.states[idx];
         let mut frame = None;
         if let Some(levels) = st.analysis.process_sample(x) {
@@ -171,8 +215,11 @@ impl ResonanceSuppressor {
             st.bands.set_gains(&gains);
             frame = Some((levels, gains));
         }
-        let wet = st.bands.process_sample(x);
-        (wet, frame)
+        // Delay the dry signal by one analysis window so the reduction
+        // computed above lands on the audio that produced it (look-ahead).
+        let dry = st.delay.push_pop(x);
+        let wet = st.bands.process_sample(dry);
+        (wet, dry, frame)
     }
 }
 

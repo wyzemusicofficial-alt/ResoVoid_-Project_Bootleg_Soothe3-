@@ -327,13 +327,14 @@ fn bool_checkbox(ui: &mut egui::Ui, label: &str, param: &BoolParam, setter: &Par
 }
 
 /// Render the input spectrum (cyan) and reduction curve (violet) on a logarithmic
-/// frequency axis. Called from the GUI thread only.
+/// frequency axis. Called from the GUI thread only. The top of the axis is
+/// Nyquist-aware so it never plots bands above the actual sample rate's limit.
 fn render_visualizer(
     ui: &mut egui::Ui,
     spectrum: &[f32; BANDS],
     reduction: &[f32; BANDS],
     centers: &[f32; BANDS],
-    _sample_rate: f32,
+    sample_rate: f32,
 ) {
     let (rect, _response) = ui.allocate_exact_size(
         egui::vec2(ui.available_width(), 240.0),
@@ -353,7 +354,7 @@ fn render_visualizer(
     let plot = rect.shrink(12.0);
 
     let f_min = 20.0_f32;
-    let f_max = 20000.0_f32;
+    let f_max = (sample_rate * 0.5).min(20000.0).max(f_min * 2.0);
     let l_min = f_min.log10();
     let l_max = f_max.log10();
     let db_min = -80.0_f32;
@@ -453,7 +454,10 @@ fn render_visualizer(
     painter.text(
         egui::pos2(plot.left() + 6.0, plot.top() + 4.0),
         egui::Align2::LEFT_TOP,
-        "Spectrum (cyan) / Reduction (violet), 20 Hz - 20 kHz, log",
+        format!(
+            "Spectrum (cyan) / Reduction (violet), 20 Hz - {} kHz, log",
+            (f_max / 1000.0).round() as u32
+        ),
         egui::FontId::proportional(11.0),
         TEXT_DIM,
     );

@@ -66,6 +66,12 @@ impl AnalysisEngine {
 
     /// Feed one input sample. Returns per-band levels in dB once a full
     /// (non-overlapping) analysis window has been collected.
+    ///
+    /// NOTE: windows are intentionally non-overlapping (`write_pos` resets to 0
+    /// after each full block). This is a deliberate tradeoff: cheaper than
+    /// hop-based overlap-add, and the per-band biquad cascade smooths gain
+    /// changes between updates. The detector consequently refreshes once per
+    /// window rather than every hop. See the README "Design Notes".
     pub fn process_sample(&mut self, x: f32) -> Option<[f32; BANDS]> {
         self.buf[self.write_pos] = x;
         self.write_pos += 1;

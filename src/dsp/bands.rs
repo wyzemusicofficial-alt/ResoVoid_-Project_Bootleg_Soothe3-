@@ -30,7 +30,7 @@ pub fn compute_band_layout(fft_size: usize, sample_rate: f32) -> BandLayout {
     let bin_res = sample_rate / fft_size as f32;
     let bin_of = |f: f32| -> usize {
         let b = (f / bin_res).round() as usize;
-        b.min(fft_size / 2).max(0)
+        b.min(fft_size / 2)
     };
 
     let mut bin_lo = [0usize; BANDS];
@@ -65,5 +65,49 @@ pub fn compute_band_layout(fft_size: usize, sample_rate: f32) -> BandLayout {
         bin_lo,
         bin_hi,
         q,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::compute_band_layout;
+    use crate::dsp::BANDS;
+
+    #[test]
+    fn layout_is_log_spaced_and_in_range() {
+        let sr = 44100.0;
+        let fft = 2048;
+        let layout = compute_band_layout(fft, sr);
+
+        // Lowest band starts at ~20 Hz; highest band stays below ~96% Nyquist
+        // (capped at 20 kHz for 44.1 kHz).
+        assert!((layout.centers[0] - 20.0).abs() < 1.0, "first center ~20 Hz");
+        let nyquist = sr * 0.5;
+        let expected_max = (nyquist * 0.96).min(20000.0);
+        assert!(
+            layout.centers[BANDS - 1] <= expected_max + 1.0,
+            "last center within range"
+        );
+
+        // Centers must be strictly increasing (log spacing).
+        for i in 1..BANDS {
+            assert!(layout.centers[i] > layout.centers[i - 1]);
+        }
+
+        // Each band's bin range is well-formed and every Q is clamped.
+        let half = fft / 2;
+        for i in 0..BANDS {
+            assert!(layout.bin_lo[i] < layout.bin_hi[i]);
+            assert!(layout.bin_hi[i] <= half);
+            assert!((0.3..=18.0).contains(&layout.q[i]), "q in bounds");
+        }
+    }
+
+    #[test]
+    fn layout_scales_with_sample_rate() {
+        let low = compute_band_layout(2048, 22050.0);
+        let high = compute_band_layout(2048, 96000.0);
+        // At higher sample rates the top band reaches higher frequencies.
+        assert!(high.centers[BANDS - 1] > low.centers[BANDS - 1]);
     }
 }
