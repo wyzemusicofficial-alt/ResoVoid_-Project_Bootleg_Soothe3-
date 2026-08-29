@@ -1,0 +1,36 @@
+﻿[package]
+name = "resovoid"
+version = "0.1.0"
+edition = "2021"
+authors = ["Wyz3Music <wyzemusicofficial@gmail.com>"]
+license = "GPL-3.0-only"
+homepage = "https://www.youtube.com/@wyzemusic_official"
+description = "ResoVoid - Dynamic Resonance Suppressor inspired by Oeksound Soothe2"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+nice-plug = "0.3"
+nice-plug-egui = "0.4"
+egui = { version = "0.36", features = ["default_fonts"] }
+realfft = "3"
+atomic_float = "1.1"
+rtrb = "0.3.3"
+num-complex = "0.4"
+
+[profile.release]
+lto = "thin"
+strip = "symbols"
+
+[profile.profiling]
+inherits = "release"
+debug = true
+strip = "none"
+
+[features]
+# Enables nice-plug's allocation checker for `process()`. Useful to verify the
+# hybrid engine stays allocation-free on the audio thread.
+assert_process_allocs = ["nice-plug/assert_process_allocs"]
+
+
