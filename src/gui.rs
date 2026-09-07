@@ -222,7 +222,7 @@ fn section_header(ui: &mut egui::Ui, title: &str) {
 
 /// Draw a native egui rotary knob.
 fn draw_knob(ui: &mut egui::Ui, label: &str, value: f32, min: f32, max: f32) -> Option<f32> {
-    let size = egui::vec2(70.0, 70.0);
+    let size = egui::vec2(70.0, 110.0);
     let (rect, response) = ui.allocate_exact_size(size, egui::Sense::drag());
     let painter = ui.painter_at(rect);
     let center = rect.center();
@@ -303,6 +303,59 @@ fn draw_arc(
         painter.line_segment([prev, p], stroke);
         prev = p;
     }
+}
+
+/// Interpolate smooth curve points from sparse log-spaced band centers/values.
+/// Uses linear interpolation in log-frequency space to generate `target_points` render points.
+fn interpolate_curve(
+    centers: &[f32; BANDS],
+    values: &[f32; BANDS],
+    f_min: f32,
+    f_max: f32,
+    x_of: &dyn Fn(f32) -> f32,
+    y_of: &dyn Fn(f32) -> f32,
+    target_points: usize,
+) -> Vec<egui::Pos2> {
+    let mut result = Vec::with_capacity(target_points);
+    let l_min = f_min.log10();
+    let l_max = f_max.log10();
+
+    for i in 0..target_points {
+        let t = i as f32 / (target_points - 1) as f32;
+        let l = l_min + t * (l_max - l_min);
+        let freq = 10.0_f32.powf(l);
+
+        let idx = centers
+            .iter()
+            .position(|&c| c > freq)
+            .unwrap_or(BANDS - 1);
+
+        if idx == 0 || idx >= BANDS {
+            let x = x_of(freq);
+            let y = y_of(values[idx.clamp(0, BANDS - 1)]);
+            result.push(egui::pos2(x, y));
+            continue;
+        }
+
+        let c0 = centers[idx - 1];
+        let c1 = centers[idx];
+        let v0 = values[idx - 1];
+        let v1 = values[idx];
+
+        let l0 = c0.max(f_min).log10();
+        let l1 = c1.max(f_min).log10();
+        let t_local = if l1 > l0 {
+            (l - l0) / (l1 - l0)
+        } else {
+            0.0
+        };
+
+        let v_interp = v0 + t_local * (v1 - v0);
+        let x = x_of(freq);
+        let y = y_of(v_interp);
+        result.push(egui::pos2(x, y));
+    }
+    result
 }
 
 /// Map a parameter to a knob and apply changes through the `ParamSetter`.
@@ -394,17 +447,18 @@ fn render_visualizer(
         );
     }
 
-    // Input spectrum polyline + soft filled area.
-    let mut spec_pts: Vec<egui::Pos2> = Vec::with_capacity(BANDS);
-    for i in 0..BANDS {
-        if centers[i] <= 0.0 {
-            continue;
-        }
-        if centers[i] < f_min || centers[i] > f_max {
-            continue;
-        }
-        spec_pts.push(egui::pos2(x_of(centers[i]), y_of(spectrum[i].clamp(db_min, db_max))));
-    }
+    const INTERP_POINTS: usize = 512;
+
+    // Input spectrum: interpolate smooth curve from 64 band centers.
+    let spec_pts = interpolate_curve(
+        centers,
+        spectrum,
+        f_min,
+        f_max,
+        &x_of,
+        &|db| y_of(db.clamp(db_min, db_max)),
+        INTERP_POINTS,
+    );
     if spec_pts.len() >= 2 {
         let mut area = spec_pts.clone();
         area.push(egui::pos2(plot.right(), plot.bottom()));
@@ -418,18 +472,23 @@ fn render_visualizer(
         painter.add(egui::Shape::line(spec_pts, egui::Stroke::new(1.8, CYAN)));
     }
 
-    // Reduction curve: linear gain -> dB (<= 0). Violet line.
-    let mut red_pts: Vec<egui::Pos2> = Vec::with_capacity(BANDS);
-    for i in 0..BANDS {
-        if centers[i] <= 0.0 {
-            continue;
+    // Reduction curve: linear gain -> dB (<= 0). Interpolated smooth violet line.
+    let reduction_db: [f32; BANDS] = {
+        let mut arr = [0.0_f32; BANDS];
+        for i in 0..BANDS {
+            arr[i] = 20.0 * (reduction[i].max(1e-4)).log10();
         }
-        if centers[i] < f_min || centers[i] > f_max {
-            continue;
-        }
-        let rdb = 20.0 * (reduction[i].max(1e-4)).log10();
-        red_pts.push(egui::pos2(x_of(centers[i]), y_of(rdb.clamp(-40.0, 0.0))));
-    }
+        arr
+    };
+    let red_pts = interpolate_curve(
+        centers,
+        &reduction_db,
+        f_min,
+        f_max,
+        &x_of,
+        &|db| y_of(db.clamp(-40.0, 0.0)),
+        INTERP_POINTS,
+    );
     if red_pts.len() >= 2 {
         painter.add(egui::Shape::line(red_pts, egui::Stroke::new(2.0, VIOLET)));
     }
