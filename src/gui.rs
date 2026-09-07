@@ -26,10 +26,9 @@ use egui::Color32;
 use rtrb::Consumer;
 
 use crate::dsp::analysis::AnalysisFrame;
+use crate::dsp::suppressor::FFT_SIZES;
 use crate::dsp::BANDS;
 use crate::ResoVoidParams;
-
-const FFT_SIZES: [usize; 4] = [1024, 2048, 4096, 8192];
 
 // ----- Light and airy palette ----------------------------------------------
 const BG_PAGE: Color32  = Color32::from_rgb(238, 242, 248); // soft blue-gray page
