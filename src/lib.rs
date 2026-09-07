@@ -51,6 +51,18 @@ pub struct ResoVoidParams {
 
     #[id = "delt"]
     pub delta: BoolParam,
+
+    /// Low region depth multiplier (anchor: 200 Hz).
+    #[id = "node0"]
+    pub node_depth_0: FloatParam,
+
+    /// Mid region depth multiplier (anchor: 2000 Hz).
+    #[id = "node1"]
+    pub node_depth_1: FloatParam,
+
+    /// High region depth multiplier (anchor: 12000 Hz).
+    #[id = "node2"]
+    pub node_depth_2: FloatParam,
 }
 
 impl Default for ResoVoidParams {
@@ -101,6 +113,15 @@ impl Default for ResoVoidParams {
 
             soft_mode: BoolParam::new("Mode", false),
             delta: BoolParam::new("Delta", false),
+
+            node_depth_0: FloatParam::new("Node Low", 1.0, FloatRange::Linear { min: 0.0, max: 1.0 })
+                .with_smoother(SmoothingStyle::Linear(5.0)),
+
+            node_depth_1: FloatParam::new("Node Mid", 1.0, FloatRange::Linear { min: 0.0, max: 1.0 })
+                .with_smoother(SmoothingStyle::Linear(5.0)),
+
+            node_depth_2: FloatParam::new("Node High", 1.0, FloatRange::Linear { min: 0.0, max: 1.0 })
+                .with_smoother(SmoothingStyle::Linear(5.0)),
         }
     }
 }
@@ -133,6 +154,7 @@ impl Default for ResoVoid {
             centers: [0.0; BANDS],
             sample_rate: sample_rate_shared.clone(),
             gui_ctx: None,
+            node_positions: [1.0, 1.0, 1.0],
         };
 
         Self {
@@ -225,6 +247,11 @@ impl Plugin for ResoVoid {
             mix: self.params.mix.smoothed.next(),
             soft_mode: self.params.soft_mode.value(),
             delta_mode: self.params.delta.value(),
+            node_depths: [
+                self.params.node_depth_0.smoothed.next(),
+                self.params.node_depth_1.smoothed.next(),
+                self.params.node_depth_2.smoothed.next(),
+            ],
         };
         self.suppressor.set_params(dsp_params);
 

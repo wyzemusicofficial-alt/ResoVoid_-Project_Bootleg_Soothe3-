@@ -21,6 +21,8 @@ pub struct DetectParams {
     pub attack_ms: f32,
     pub release_ms: f32,
     pub soft_mode: bool,
+    /// Per-region depth multipliers: [Low, Mid, High] at anchors 200 Hz, 2000 Hz, 12000 Hz.
+    pub node_depths: [f32; 3],
 }
 
 impl Default for DetectParams {
@@ -32,6 +34,7 @@ impl Default for DetectParams {
             attack_ms: 10.0,
             release_ms: 100.0,
             soft_mode: false,
+            node_depths: [1.0, 1.0, 1.0],
         }
     }
 }
@@ -62,8 +65,13 @@ impl Detector {
     /// updates, which keeps the biquad coefficients from zipper-noising. If
     /// zipper noise is audible at small FFT sizes (1024, where windows are
     /// short), consider moving the follower to per-sample operation.
+    ///
+    /// The 3 node_depths act as per-region depth attenuators — dragging a node
+    /// down reduces suppression in that frequency neighborhood. This is NOT full
+    /// per-band automation. It's 3 fixed-frequency region multipliers on the
+    /// global depth parameter.
     #[inline]
-    pub fn process_frame(&mut self, levels_db: &[f32; BANDS], p: &DetectParams) -> [f32; BANDS] {
+    pub fn process_frame(&mut self, levels_db: &[f32; BANDS], p: &DetectParams, band_centers: &[f32; BANDS]) -> [f32; BANDS] {
         let frame_time = self.frame_samples / self.sample_rate;
 
         let baseline_attack = coef(p.attack_ms, frame_time);
@@ -75,11 +83,35 @@ impl Detector {
         let thr = (1.0 - p.selectivity) * 12.0 + p.selectivity * 1.0;
         let scale = if p.soft_mode { 0.7 } else { 1.0 };
 
+        // Anchor frequencies for the 3 node regions: Low=200 Hz, Mid=2000 Hz, High=12000 Hz.
+        const ANCHOR_FREQS: [f32; 3] = [200.0, 2000.0, 12000.0];
+        // Width in octaves for the triangular weight (±1 octave each side).
+        const ANCHOR_WIDTH_OCT: f32 = 1.0;
+
         // Spectral (cross-band) reference — median over neighboring bands at the same instant.
         let medians = spectral_median(levels_db);
 
         let mut out = [1.0f32; BANDS];
         for i in 0..BANDS {
+            // Compute region_depth: weighted average of node_depths based on
+            // log-frequency proximity to each anchor.
+            let band_log = band_centers[i].max(1.0).log2();
+            let mut weighted_sum = 0.0f32;
+            let mut total_weight = 0.0f32;
+            for j in 0..3 {
+                let anchor_log = ANCHOR_FREQS[j].log2();
+                let dist_octaves = (band_log - anchor_log).abs();
+                // Triangular weight: 1.0 at center, linearly to 0.0 at ±width.
+                let w = (1.0 - dist_octaves / ANCHOR_WIDTH_OCT).max(0.0);
+                weighted_sum += p.node_depths[j] * w;
+                total_weight += w;
+            }
+            let region_depth = if total_weight > 1e-6 {
+                weighted_sum / total_weight
+            } else {
+                1.0 // No anchor influence, use full depth
+            };
+
             // Smooth *toward the spectral median*, not toward this band's own raw level.
             // This prevents a sustained resonance from being "learned" as normal.
             let spectral_ref = medians[i];
@@ -92,9 +124,11 @@ impl Detector {
 
             let reference = self.baseline[i] + thr;
             let excess = levels_db[i] - reference;
+            // Apply region_depth multiplier to the global depth before computing reduction.
+            let effective_depth = p.depth * region_depth;
             let mut reduction_db = 0.0f32;
             if excess > 0.0 {
-                reduction_db = (excess * p.depth * scale * (0.5 + p.sharpness)).min(36.0);
+                reduction_db = (excess * effective_depth * scale * (0.5 + p.sharpness)).min(36.0);
             }
             let target_gain = 10.0f32.powf(-reduction_db / 20.0);
             let gcoef = if target_gain < self.gain[i] {
@@ -155,6 +189,21 @@ mod tests {
     use super::{DetectParams, Detector};
     use crate::dsp::BANDS;
 
+    /// Generate log-spaced band centers for tests.
+    fn test_centers() -> [f32; BANDS] {
+        let f_min = 20.0_f32;
+        let f_max = 20000.0_f32;
+        let l_min = f_min.log10();
+        let l_max = f_max.log10();
+        let mut centers = [0.0f32; BANDS];
+        for i in 0..BANDS {
+            let t = i as f32 / (BANDS - 1) as f32;
+            let l = l_min + t * (l_max - l_min);
+            centers[i] = 10.0_f32.powf(l);
+        }
+        centers
+    }
+
     fn params() -> DetectParams {
         DetectParams {
             depth: 1.0,
@@ -163,22 +212,24 @@ mod tests {
             attack_ms: 10.0,
             release_ms: 100.0,
             soft_mode: false,
+            node_depths: [1.0, 1.0, 1.0],
         }
     }
 
     #[test]
     fn suppresses_hot_band_reduces_others() {
         let mut det = Detector::new(2048, 44100.0);
+        let centers = test_centers();
         // Establish a quiet spectral baseline first.
         let quiet = [-30.0f32; BANDS];
         for _ in 0..20 {
-            det.process_frame(&quiet, &params());
+            det.process_frame(&quiet, &params(), &centers);
         }
         // A large transient above the baseline + threshold is caught.
         let mut levels = quiet;
         levels[10] = 40.0;
 
-        let gains = det.process_frame(&levels, &params());
+        let gains = det.process_frame(&levels, &params(), &centers);
 
         // Hot band gets attenuation (gain < 1).
         assert!(gains[10] < 1.0, "hot band should be reduced");
@@ -190,8 +241,9 @@ mod tests {
     #[test]
     fn flat_spectrum_yields_unity_gain() {
         let mut det = Detector::new(2048, 44100.0);
+        let centers = test_centers();
         let levels = [-60.0f32; BANDS]; // all below the 12 dB threshold
-        let gains = det.process_frame(&levels, &params());
+        let gains = det.process_frame(&levels, &params(), &centers);
         for g in gains.iter() {
             assert!((g - 1.0).abs() < 1e-3, "no reduction on quiet spectrum");
         }
@@ -204,11 +256,12 @@ mod tests {
         // threshold distinction matters: flat at -10 dB, one band 10 dB hotter at 0 dB.
         let mut det_lo = Detector::new(2048, 44100.0);
         let mut det_hi = Detector::new(2048, 44100.0);
+        let centers = test_centers();
         // Prime the smoothed spectral reference to the flat level.
         let flat = [-10.0f32; BANDS];
         for _ in 0..20 {
-            det_lo.process_frame(&flat, &params());
-            det_hi.process_frame(&flat, &params());
+            det_lo.process_frame(&flat, &params(), &centers);
+            det_hi.process_frame(&flat, &params(), &centers);
         }
         let mut levels = flat;
         levels[10] = 0.0; // 10 dB above median
@@ -218,8 +271,8 @@ mod tests {
         let mut p_hi = params();
         p_hi.selectivity = 1.0; // thr = 1 dB -> easily caught
 
-        let g_lo = det_lo.process_frame(&levels, &p_lo)[10];
-        let g_hi = det_hi.process_frame(&levels, &p_hi)[10];
+        let g_lo = det_lo.process_frame(&levels, &p_lo, &centers)[10];
+        let g_hi = det_hi.process_frame(&levels, &p_hi, &centers)[10];
         assert!(g_hi < 1.0, "high selectivity catches the band");
         assert!((g_lo - 1.0).abs() < 1e-3, "low selectivity misses the band");
     }
@@ -228,9 +281,10 @@ mod tests {
     fn sustained_resonance_holds() {
         // Sustained resonance must stay suppressed, not recover after one attack period.
         let mut det = Detector::new(2048, 44100.0);
+        let centers = test_centers();
         let quiet = [-30.0f32; BANDS];
         for _ in 0..20 {
-            det.process_frame(&quiet, &params());
+            det.process_frame(&quiet, &params(), &centers);
         }
         let mut resonant = quiet;
         resonant[20] = 10.0; // strong narrow peak, >> median + thr
@@ -238,14 +292,14 @@ mod tests {
         let mut p = params();
         p.selectivity = 1.0; // thr = 1 dB so excess is large and unambiguous
         // First frame: should suppress
-        let g1 = det.process_frame(&resonant, &p)[20];
+        let g1 = det.process_frame(&resonant, &p, &centers)[20];
         assert!(g1 < 0.9, "first frame should suppress sustained peak");
 
         // Hold the same resonance for many frames — old per-band baseline would
         // converge and release; spectral baseline must keep suppressing.
         let mut last = g1;
         for _ in 0..20 {
-            last = det.process_frame(&resonant, &p)[20];
+            last = det.process_frame(&resonant, &p, &centers)[20];
         }
         assert!(
             last < 0.9,
@@ -257,11 +311,12 @@ mod tests {
     fn broadband_flat_no_heavy_suppression() {
         // Pink-noise-like flat spectrum should not trigger heavy suppression.
         let mut det = Detector::new(2048, 44100.0);
+        let centers = test_centers();
         let flat = [-20.0f32; BANDS];
         for _ in 0..20 {
-            det.process_frame(&flat, &params());
+            det.process_frame(&flat, &params(), &centers);
         }
-        let gains = det.process_frame(&flat, &params());
+        let gains = det.process_frame(&flat, &params(), &centers);
         for g in gains.iter() {
             assert!((g - 1.0).abs() < 5e-2, "flat broadband should not heavily suppress");
         }

@@ -16,6 +16,9 @@ pub struct DspParams {
     pub mix: f32,
     pub soft_mode: bool,
     pub delta_mode: bool,
+    /// Per-region depth multipliers: [Low, Mid, High] at anchors 200 Hz, 2000 Hz, 12000 Hz.
+    /// Each value 0.0..1.0 attenuates the global depth in that frequency neighborhood.
+    pub node_depths: [f32; 3],
 }
 
 impl Default for DspParams {
@@ -29,6 +32,7 @@ impl Default for DspParams {
             mix: 1.0,
             soft_mode: false,
             delta_mode: false,
+            node_depths: [1.0, 1.0, 1.0],
         }
     }
 }
@@ -184,6 +188,7 @@ impl ResonanceSuppressor {
         self.detect_params.attack_ms = p.attack_ms.max(0.1);
         self.detect_params.release_ms = p.release_ms.max(1.0);
         self.detect_params.soft_mode = p.soft_mode;
+        self.detect_params.node_depths = p.node_depths;
         self.mix = p.mix.clamp(0.0, 1.0);
         self.delta_mode = p.delta_mode;
     }
@@ -242,7 +247,8 @@ impl ResonanceSuppressor {
         let st = &mut ch.states[idx];
         let mut frame = None;
         if let Some(levels) = st.analysis.process_sample(x) {
-            let gains = st.detector.process_frame(&levels, &params);
+            let band_centers = st.analysis.bands().centers;
+            let gains = st.detector.process_frame(&levels, &params, &band_centers);
             st.bands.set_gains(&gains);
             frame = Some((levels, gains));
         }

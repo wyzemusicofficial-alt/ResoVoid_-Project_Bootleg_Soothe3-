@@ -41,11 +41,6 @@ const CYAN_TRACK: Color32 = Color32::from_rgb(225, 231, 240); // knob track
 const VIOLET: Color32   = Color32::from_rgb(139, 92, 255);  // secondary accent
 const GRID: Color32     = Color32::from_rgb(234, 239, 245);  // visualizer grid
 
-/// Soft translucent cyan used to fill the area under the spectrum curve.
-fn cyan_fill() -> Color32 {
-    Color32::from_rgba_unmultiplied(10, 196, 182, 38)
-}
-
 /// State for the editor window. Created once in `ResoVoid::default()` and moved into
 /// the editor the first time the host opens it.
 pub struct ResoVoidEditor {
@@ -58,6 +53,8 @@ pub struct ResoVoidEditor {
     pub sample_rate: Arc<AtomicF32>,
     /// Captured in `build()`, used to issue parameter changes from widgets.
     pub gui_ctx: Option<GuiContext>,
+    /// Current y-multiplier for each node (0.0..1.0). Index 0=Low, 1=Mid, 2=High.
+    pub node_positions: [f32; 3],
 }
 
 impl NiceEguiApp for ResoVoidEditor {
@@ -113,13 +110,18 @@ impl NiceEguiApp for ResoVoidEditor {
             ui.add_space(8.0);
 
             // Visualizer (draws its own white card).
-            render_visualizer(
-                ui,
-                &self.latest_spectrum,
-                &self.latest_reduction,
-                &self.centers,
-                sample_rate,
-            );
+            if let Some(setter) = self.gui_ctx.as_ref().map(|ctx| ctx.param_setter()) {
+                render_visualizer(
+                    ui,
+                    &self.latest_spectrum,
+                    &self.latest_reduction,
+                    &self.centers,
+                    sample_rate,
+                    &mut self.node_positions,
+                    &self.params,
+                    &setter,
+                );
+            }
 
             ui.add_space(12.0);
 
@@ -163,7 +165,7 @@ impl NiceEguiApp for ResoVoidEditor {
 
                     ui.add_space(6.0);
                     ui.horizontal(|ui| {
-                        bool_checkbox(ui, "Soft Mode", &self.params.soft_mode, &setter);
+                        pill_toggle(ui, "Soft Mode", &self.params.soft_mode, &setter);
                         ui.add_space(18.0);
                         bool_checkbox(ui, "Delta", &self.params.delta, &setter);
                     });
@@ -388,15 +390,102 @@ fn bool_checkbox(ui: &mut egui::Ui, label: &str, param: &BoolParam, setter: &Par
     }
 }
 
+/// Pill-shaped toggle for a BoolParam. Draws "SOFT" | "HARD" with the active
+/// segment highlighted in CYAN. Fixed size 120×28.
+fn pill_toggle(ui: &mut egui::Ui, _label: &str, param: &BoolParam, setter: &ParamSetter) {
+    let size = egui::vec2(120.0, 28.0);
+    let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
+    let painter = ui.painter_at(rect);
+
+    // Draw pill background.
+    painter.add(RectShape::new(
+        rect,
+        CornerRadius::same(14),
+        Color32::from_rgb(225, 231, 240),
+        egui::Stroke::new(1.0, BORDER),
+        egui::StrokeKind::Outside,
+    ));
+
+    let is_soft = !param.value(); // false = SOFT mode (default), true = HARD mode
+    let half_w = rect.width() / 2.0;
+    let left_rect = egui::Rect::from_min_size(rect.min, egui::vec2(half_w, rect.height()));
+    let right_rect = egui::Rect::from_min_size(
+        egui::pos2(rect.left() + half_w, rect.top()),
+        egui::vec2(half_w, rect.height()),
+    );
+
+    // Highlight active side.
+    if is_soft {
+        painter.add(RectShape::new(
+            left_rect,
+            CornerRadius {
+                nw: 14,
+                ne: 0,
+                sw: 14,
+                se: 0,
+            },
+            CYAN,
+            egui::Stroke::NONE,
+            egui::StrokeKind::Outside,
+        ));
+    } else {
+        painter.add(RectShape::new(
+            right_rect,
+            CornerRadius {
+                nw: 0,
+                ne: 14,
+                sw: 0,
+                se: 14,
+            },
+            CYAN,
+            egui::Stroke::NONE,
+            egui::StrokeKind::Outside,
+        ));
+    }
+
+    // Draw labels.
+    let label_color_soft = if is_soft { CARD } else { TEXT_DIM };
+    let label_color_hard = if is_soft { TEXT_DIM } else { CARD };
+    painter.text(
+        left_rect.center(),
+        egui::Align2::CENTER_CENTER,
+        "SOFT",
+        egui::FontId::proportional(11.0),
+        label_color_soft,
+    );
+    painter.text(
+        right_rect.center(),
+        egui::Align2::CENTER_CENTER,
+        "HARD",
+        egui::FontId::proportional(11.0),
+        label_color_hard,
+    );
+
+    // Handle click.
+    if response.clicked() {
+        let new_val = !param.value();
+        setter.begin_set_parameter(param);
+        setter.set_parameter(param, new_val);
+        setter.end_set_parameter(param);
+    }
+}
+
 /// Render the input spectrum (cyan) and reduction curve (violet) on a logarithmic
 /// frequency axis. Called from the GUI thread only. The top of the axis is
 /// Nyquist-aware so it never plots bands above the actual sample rate's limit.
+///
+/// Includes 3 draggable node markers (Low/Mid/High) that act as per-region
+/// depth multipliers. This is NOT full per-band automation. It's 3
+/// fixed-frequency region multipliers on the global depth parameter.
 fn render_visualizer(
     ui: &mut egui::Ui,
     spectrum: &[f32; BANDS],
     reduction: &[f32; BANDS],
     centers: &[f32; BANDS],
     sample_rate: f32,
+    node_positions: &mut [f32; 3],
+    params: &ResoVoidParams,
+    setter: &ParamSetter,
 ) {
     let (rect, _response) = ui.allocate_exact_size(
         egui::vec2(ui.available_width(), 240.0),
@@ -404,12 +493,24 @@ fn render_visualizer(
     );
     let painter = ui.painter_at(rect);
 
-    // Card background + border.
+    // Card background + border with embedded panel look (corner_radius 16, bottom shadow).
     painter.add(RectShape::new(
         rect,
-        CornerRadius::same(12),
+        CornerRadius::same(16),
         CARD,
         egui::Stroke::new(1.0, BORDER),
+        egui::StrokeKind::Outside,
+    ));
+    // Subtle bottom shadow / darker border for embedded panel look.
+    let shadow_rect = egui::Rect::from_min_size(
+        egui::pos2(rect.left() + 1.0, rect.bottom() - 2.0),
+        egui::vec2(rect.width() - 2.0, 2.0),
+    );
+    painter.add(RectShape::new(
+        shadow_rect,
+        CornerRadius::same(0),
+        Color32::from_rgba_unmultiplied(0, 0, 0, 20),
+        egui::Stroke::NONE,
         egui::StrokeKind::Outside,
     ));
 
@@ -430,13 +531,34 @@ fn render_visualizer(
         plot.bottom() - ((db - db_min) / (db_max - db_min)) * plot.height()
     };
 
-    // Frequency grid lines.
-    for &freq in &[100.0_f32, 1000.0, 10000.0] {
-        let x = x_of(freq);
-        painter.line_segment(
-            [egui::pos2(x, plot.top()), egui::pos2(x, plot.bottom())],
-            egui::Stroke::new(1.0, GRID),
-        );
+    // Frequency grid lines and labels: 100, 250, 500, 1k, 2k, 4k, 8k, 16k.
+    let freq_ticks: &[(f32, &str)] = &[
+        (100.0, "100"),
+        (250.0, "250"),
+        (500.0, "500"),
+        (1000.0, "1k"),
+        (2000.0, "2k"),
+        (4000.0, "4k"),
+        (8000.0, "8k"),
+        (16000.0, "16k"),
+    ];
+    for &(freq, label) in freq_ticks {
+        if freq >= f_min && freq <= f_max {
+            let x = x_of(freq);
+            // Thin vertical gridline.
+            painter.line_segment(
+                [egui::pos2(x, plot.top()), egui::pos2(x, plot.bottom())],
+                egui::Stroke::new(1.0, GRID),
+            );
+            // Frequency label centered under tick mark.
+            painter.text(
+                egui::pos2(x, plot.bottom() + 10.0),
+                egui::Align2::CENTER_TOP,
+                label,
+                egui::FontId::proportional(9.0),
+                TEXT_DIM,
+            );
+        }
     }
     // dB grid lines.
     for &db in &[-60.0_f32, -40.0, -20.0, 0.0] {
@@ -459,17 +581,71 @@ fn render_visualizer(
         &|db| y_of(db.clamp(db_min, db_max)),
         INTERP_POINTS,
     );
+
+    // --- Gradient fill under spectrum (vertical gradient, 40 strips) ---
     if spec_pts.len() >= 2 {
-        let mut area = spec_pts.clone();
-        area.push(egui::pos2(plot.right(), plot.bottom()));
-        area.push(egui::pos2(plot.left(), plot.bottom()));
-        painter.add(egui::Shape::Path(PathShape {
-            points: area,
-            closed: true,
-            fill: cyan_fill(),
-            stroke: egui::Stroke::NONE.into(),
-        }));
-        painter.add(egui::Shape::line(spec_pts, egui::Stroke::new(1.8, CYAN)));
+        let strip_count = 40;
+        for s in 0..strip_count {
+            let t = s as f32 / strip_count as f32;
+            let alpha = ((1.0 - t) * 38.0) as u8; // fades from 38 to 0
+            let fill_color = Color32::from_rgba_unmultiplied(10, 196, 182, alpha);
+
+            let y_bottom = plot.bottom() - t * plot.height();
+            let y_top = plot.bottom() - (t + 1.0 / strip_count as f32) * plot.height();
+
+            // Clip the curve to this strip's vertical band.
+            let mut strip_pts: Vec<egui::Pos2> = Vec::new();
+            for &pt in &spec_pts {
+                if pt.y <= y_top && pt.y >= y_bottom {
+                    strip_pts.push(pt);
+                }
+            }
+            // Also include boundary intersections for clean fill.
+            if strip_pts.len() >= 2 {
+                let mut area = strip_pts;
+                // Close the strip at the bottom edges.
+                area.push(egui::pos2(area.last().unwrap().x, y_bottom));
+                area.push(egui::pos2(area.first().unwrap().x, y_bottom));
+                painter.add(egui::Shape::Path(PathShape {
+                    points: area,
+                    closed: true,
+                    fill: fill_color,
+                    stroke: egui::Stroke::NONE.into(),
+                }));
+            }
+        }
+
+        // --- Filled envelope band (spectrum minus ~6dB, semi-transparent cyan) ---
+        let envelope_db_offset = 6.0; // dB below spectrum
+        let envelope_pts = interpolate_curve(
+            centers,
+            spectrum,
+            f_min,
+            f_max,
+            &x_of,
+            &|db| y_of((db - envelope_db_offset).clamp(db_min, db_max)),
+            INTERP_POINTS,
+        );
+        if envelope_pts.len() >= 2 {
+            // Build area between spectrum curve (top) and envelope curve (bottom).
+            let mut area: Vec<egui::Pos2> = Vec::with_capacity(spec_pts.len() + envelope_pts.len());
+            area.extend_from_slice(&spec_pts);
+            // Reverse the envelope to close the shape.
+            for pt in envelope_pts.iter().rev() {
+                area.push(*pt);
+            }
+            area.push(*spec_pts.first().unwrap()); // close back to start
+
+            painter.add(egui::Shape::Path(PathShape {
+                points: area,
+                closed: true,
+                fill: Color32::from_rgba_unmultiplied(10, 196, 182, 24),
+                stroke: egui::Stroke::NONE.into(),
+            }));
+        }
+
+        // Draw the main spectrum line on top.
+        painter.add(egui::Shape::line(spec_pts.clone(), egui::Stroke::new(1.8, CYAN)));
     }
 
     // Reduction curve: linear gain -> dB (<= 0). Interpolated smooth violet line.
@@ -493,22 +669,72 @@ fn render_visualizer(
         painter.add(egui::Shape::line(red_pts, egui::Stroke::new(2.0, VIOLET)));
     }
 
-    // Axis tick labels.
-    for &freq in &[100.0_f32, 1000.0, 10000.0] {
-        let label = match freq {
-            100.0 => "100",
-            1000.0 => "1k",
-            10000.0 => "10k",
-            _ => "",
-        };
-        painter.text(
-            egui::pos2(x_of(freq), plot.bottom() - 12.0),
-            egui::Align2::CENTER_CENTER,
-            label,
-            egui::FontId::proportional(10.0),
-            TEXT_DIM,
+    // --- Interactive node markers (3 draggable handles) ---
+    // Node 0 ("Low"):  200 Hz
+    // Node 1 ("Mid"):  2000 Hz
+    // Node 2 ("High"): 12000 Hz
+    const ANCHOR_FREQS: [f32; 3] = [200.0, 2000.0, 12000.0];
+    const NODE_COLORS: [Color32; 3] = [CYAN, Color32::from_rgb(236, 72, 153), Color32::from_rgb(250, 204, 21)];
+    const NODE_LABELS: [&str; 3] = ["L", "M", "H"];
+    let node_radius = 8.0;
+
+    // Get the interpolated spectrum value at each anchor frequency for the y-position.
+    for i in 0..3 {
+        let anchor = ANCHOR_FREQS[i];
+        if anchor < f_min || anchor > f_max {
+            continue;
+        }
+
+        // Node center: x = frequency position, y = mapped from node_positions[i].
+        // node_positions[i] = 1.0 → top of plot (full depth), 0.0 → bottom (no depth).
+        let node_y = plot.bottom() - node_positions[i] * plot.height();
+        let node_center = egui::pos2(x_of(anchor), node_y);
+
+        // Draw the node circle with white stroke.
+        painter.circle_filled(node_center, node_radius, NODE_COLORS[i]);
+        painter.circle_stroke(
+            node_center,
+            node_radius,
+            egui::Stroke::new(2.0, CARD),
         );
+
+        // Label inside the circle.
+        painter.text(
+            node_center,
+            egui::Align2::CENTER_CENTER,
+            NODE_LABELS[i],
+            egui::FontId::proportional(10.0),
+            CARD,
+        );
+
+        // Handle drag: if mouse is within 12px of node center, track vertical drag.
+        let node_response = ui.interact(
+            egui::Rect::from_center_size(node_center, egui::vec2(24.0, 24.0)),
+            egui::Id::new(format!("node_{i}")),
+            egui::Sense::drag(),
+        );
+
+        if node_response.dragged() {
+            let delta_y = node_response.drag_delta().y;
+            // Map y movement to multiplier change. Positive delta_y = drag down = decrease multiplier.
+            let dy_normalized = -delta_y / plot.height();
+            let new_pos = (node_positions[i] + dy_normalized).clamp(0.0, 1.0);
+            node_positions[i] = new_pos;
+
+            // Write to the corresponding FloatParam.
+            let param = match i {
+                0 => &params.node_depth_0,
+                1 => &params.node_depth_1,
+                2 => &params.node_depth_2,
+                _ => unreachable!(),
+            };
+            setter.begin_set_parameter(param);
+            setter.set_parameter(param, new_pos);
+            setter.end_set_parameter(param);
+        }
     }
+
+    // Axis tick labels for dB.
     for &db in &[-60.0_f32, -40.0, -20.0, 0.0] {
         painter.text(
             egui::pos2(plot.left() + 4.0, y_of(db)),
