@@ -1,7 +1,4 @@
-﻿// src/lib.rs
-// ResoVoid - Dynamic Resonance Suppressor (nice-plug + egui)
-
-use std::sync::Arc;
+﻿use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use atomic_float::AtomicF32;
@@ -18,9 +15,9 @@ mod dsp;
 mod gui;
 
 use dsp::{AnalysisFrame, BANDS, ResonanceSuppressor};
+use dsp::suppressor::DspParams;
 use gui::ResoVoidEditor;
 
-/// Initial logical window size for the editor.
 const WINDOW_SIZE: LogicalSize<f32> = LogicalSize::new(900.0, 560.0);
 
 #[derive(Params)]
@@ -115,9 +112,7 @@ pub struct ResoVoid {
     editor_state: Arc<EguiEditorState>,
     repaint_notifier: RepaintNotifier,
 
-    /// Shared so the GUI axis knows the current sample rate.
     sample_rate_shared: Arc<AtomicF32>,
-    /// Currently active FFT size index (mirrors `fft_size` param).
     current_fft_index: usize,
 
     initial_editor: Option<ResoVoidEditor>,
@@ -205,7 +200,7 @@ impl Plugin for ResoVoid {
 
         let idx = self.params.fft_size.value().clamp(0, 3) as usize;
         self.current_fft_index = idx;
-        self.suppressor.set_fft_size_index(idx as i64);
+        self.suppressor.set_fft_size_index(idx);
         context.set_latency_samples(self.suppressor.latency() as u32);
         true
     }
@@ -214,32 +209,34 @@ impl Plugin for ResoVoid {
         self.suppressor.reset();
     }
 
+    #[inline]
     fn process(
         &mut self,
         buffer: &mut Buffer,
         _aux: &mut AuxiliaryBuffers,
         context: &mut impl ProcessContext<Self>,
     ) -> ProcessStatus {
-        // Update DSP parameters from the (smoothed) parameter values.
-        self.suppressor.set_depth(self.params.depth.smoothed.next());
-        self.suppressor.set_sharpness(self.params.sharpness.smoothed.next());
-        self.suppressor.set_selectivity(self.params.selectivity.smoothed.next());
-        self.suppressor.set_attack(self.params.attack.value());
-        self.suppressor.set_release(self.params.release.value());
-        self.suppressor.set_mix(self.params.mix.smoothed.next());
-        self.suppressor.set_soft_mode(self.params.soft_mode.value());
-        self.suppressor.set_delta_mode(self.params.delta.value());
+        let dsp_params = DspParams {
+            depth: self.params.depth.smoothed.next(),
+            sharpness: self.params.sharpness.smoothed.next(),
+            selectivity: self.params.selectivity.smoothed.next(),
+            attack_ms: self.params.attack.smoothed.next(),
+            release_ms: self.params.release.smoothed.next(),
+            mix: self.params.mix.smoothed.next(),
+            soft_mode: self.params.soft_mode.value(),
+            delta_mode: self.params.delta.value(),
+        };
+        self.suppressor.set_params(dsp_params);
 
-        // Swap FFT size (and latency) only when the index actually changes.
         let idx = self.params.fft_size.value().clamp(0, 3) as usize;
         if idx != self.current_fft_index {
             self.current_fft_index = idx;
-            self.suppressor.set_fft_size_index(idx as i64);
+            self.suppressor.set_fft_size_index(idx);
             context.set_latency_samples(self.suppressor.latency() as u32);
         }
 
         let output_gain_db = self.params.output_gain.smoothed.next();
-        let gain = 10.0_f32.powf(output_gain_db / 20.0);
+        let gain = dsp::suppressor::db_to_linear(output_gain_db);
 
         let channels = buffer.as_slice();
         let num_samples = channels.first().map(|c| c.len()).unwrap_or(0);
@@ -286,4 +283,3 @@ impl Vst3Plugin for ResoVoid {
 
 nice_export_clap!(ResoVoid);
 nice_export_vst3!(ResoVoid);
-

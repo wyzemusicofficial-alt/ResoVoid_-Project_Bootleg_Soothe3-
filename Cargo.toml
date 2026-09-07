@@ -33,4 +33,7 @@ strip = "none"
 # hybrid engine stays allocation-free on the audio thread.
 assert_process_allocs = ["nice-plug/assert_process_allocs"]
 
+[workspace]
+members = ["xtask"]
+
 

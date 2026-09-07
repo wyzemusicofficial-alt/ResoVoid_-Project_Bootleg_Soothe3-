@@ -29,6 +29,8 @@ use crate::dsp::analysis::AnalysisFrame;
 use crate::dsp::BANDS;
 use crate::ResoVoidParams;
 
+const FFT_SIZES: [usize; 4] = [1024, 2048, 4096, 8192];
+
 // ----- Light and airy palette ----------------------------------------------
 const BG_PAGE: Color32  = Color32::from_rgb(238, 242, 248); // soft blue-gray page
 const CARD: Color32     = Color32::from_rgb(255, 255, 255); // white card
@@ -150,6 +152,14 @@ impl NiceEguiApp for ResoVoidEditor {
                     ui.horizontal(|ui| {
                         ui.label(egui::RichText::new("FFT Size").color(TEXT));
                         ui.add(widgets::ParamSlider::for_param(&self.params.fft_size, &setter));
+                        let fft_idx = self.params.fft_size.value().clamp(0, 3) as usize;
+                        let fft_size = FFT_SIZES[fft_idx];
+                        let latency_ms = fft_size as f32 / sample_rate * 1000.0;
+                        ui.label(
+                            egui::RichText::new(format!("({latency_ms:.1} ms latency)"))
+                                .size(11.0)
+                                .color(TEXT_DIM),
+                        );
                     });
 
                     ui.add_space(6.0);

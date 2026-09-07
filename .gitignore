@@ -1,1 +1,9 @@
 /target
+.cargo/
+Example plugins/
+
+# Transcript / learning notes
+*.txt
+21_Plus_Rust_Pro_Tips_Rewritten.md
+Building_an_EQ_Plugin_in_Rust_Using_State_Variable_Filters_Rewritten.md
+Transcript_of_*

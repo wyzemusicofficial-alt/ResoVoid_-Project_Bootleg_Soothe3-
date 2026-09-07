@@ -72,6 +72,7 @@ impl AnalysisEngine {
     /// hop-based overlap-add, and the per-band biquad cascade smooths gain
     /// changes between updates. The detector consequently refreshes once per
     /// window rather than every hop. See the README "Design Notes".
+    #[inline]
     pub fn process_sample(&mut self, x: f32) -> Option<[f32; BANDS]> {
         self.buf[self.write_pos] = x;
         self.write_pos += 1;
@@ -103,6 +104,11 @@ impl AnalysisEngine {
         } else {
             None
         }
+    }
+
+    pub fn reset(&mut self) {
+        self.buf.fill(0.0);
+        self.write_pos = 0;
     }
 }
 

@@ -11,7 +11,6 @@
 use crate::dsp::BANDS;
 
 /// Half-window radius for the spectral median (total window = 2*R+1 = 13 bands).
-/// Fixed constant per fix plan — expose as param only if ear-testing warrants it.
 const MEDIAN_HALF_WINDOW: usize = 6;
 
 #[derive(Clone, Copy)]
@@ -63,6 +62,7 @@ impl Detector {
     /// updates, which keeps the biquad coefficients from zipper-noising. If
     /// zipper noise is audible at small FFT sizes (1024, where windows are
     /// short), consider moving the follower to per-sample operation.
+    #[inline]
     pub fn process_frame(&mut self, levels_db: &[f32; BANDS], p: &DetectParams) -> [f32; BANDS] {
         let frame_time = self.frame_samples / self.sample_rate;
 
