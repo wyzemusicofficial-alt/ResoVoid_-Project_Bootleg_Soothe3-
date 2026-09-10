@@ -125,6 +125,7 @@ pub struct ResoVoidEditor {
     pub selected_preset: String,
     pub show_save_dialog: bool,
     pub save_name: String,
+    pub show_overwrite_confirm: bool,
     pub presets_refresh_at: f64,
 }
 
@@ -260,6 +261,19 @@ impl NiceEguiApp for ResoVoidEditor {
                         );
                     });
 
+                    // Re-scan the presets dir at most every 2 s (fs IO stays
+                    // off the per-frame hot path).
+                    let now = ui.input(|i| i.time);
+                    if now >= self.presets_refresh_at {
+                        self.preset_names = crate::presets::list_presets();
+                        if self.selected_preset.is_empty() {
+                            if let Some(first) = self.preset_names.first().cloned() {
+                                self.selected_preset = first;
+                            }
+                        }
+                        self.presets_refresh_at = now + 2.0;
+                    }
+
                     ui.add_space(6.0);
                     ui.horizontal(|ui| {
                         pill_toggle(ui, "Soft Mode", &self.params.soft_mode, &setter, &theme);
@@ -267,6 +281,40 @@ impl NiceEguiApp for ResoVoidEditor {
                         bool_checkbox(ui, "Delta", &self.params.delta, &setter, &theme);
                         ui.add_space(18.0);
                         pill_toggle(ui, "Oversampling", &self.params.oversampling, &setter, &theme);
+                        ui.add_space(18.0);
+                        ui.separator();
+                        ui.add_space(8.0);
+                        egui::ComboBox::from_label("Preset")
+                            .selected_text(self.selected_preset.clone())
+                            .show_ui(ui, |ui| {
+                                for idx in 0..self.preset_names.len() {
+                                    let name = self.preset_names[idx].clone();
+                                    ui.selectable_value(
+                                        &mut self.selected_preset,
+                                        name.clone(),
+                                        &name,
+                                    );
+                                }
+                            });
+                        if ui.button("Load").clicked() && !self.selected_preset.is_empty() {
+                            if let Ok(preset) =
+                                crate::presets::load_preset(&self.selected_preset)
+                            {
+                                apply_preset(&self.params, &setter, &preset.values);
+                            }
+                        }
+                        if ui.button("Save").clicked() {
+                            self.save_name = self.selected_preset.clone();
+                            self.show_save_dialog = true;
+                        }
+                        if ui.button("Delete").clicked() && !self.selected_preset.is_empty() {
+                            let target = self.selected_preset.clone();
+                            if crate::presets::delete_preset(&target).is_ok() {
+                                self.selected_preset.clear();
+                                // Force a rescan so the deleted file disappears.
+                                self.presets_refresh_at = f64::NEG_INFINITY;
+                            }
+                        }
                         // Dark-mode switch pinned to the right end of the same
                         // row (right_to_left only flips direction — it claims
                         // no vertical space, so the cards can't be pushed away).
@@ -292,63 +340,48 @@ impl NiceEguiApp for ResoVoidEditor {
                     });
                 });
 
-                // Presets card (GUI thread only; the audio thread is untouched).
-                ui.add_space(12.0);
-                let mut pcard = egui::Frame::default();
-                pcard.fill = theme.card;
-                pcard.stroke = egui::Stroke::new(1.0, theme.border);
-                pcard.corner_radius = CornerRadius::same(12);
-                pcard.inner_margin = egui::Margin::same(14);
-                pcard.show(ui, |ui| {
-                    section_header(ui, "Presets", &theme);
-                    ui.add_space(8.0);
-
-                    // Re-scan the presets dir at most every 2 s (fs IO stays
-                    // off the per-frame hot path).
-                    let now = ui.input(|i| i.time);
-                    if now >= self.presets_refresh_at {
-                        self.preset_names = crate::presets::list_presets();
-                        if self.selected_preset.is_empty() {
-                            if let Some(first) = self.preset_names.first().cloned() {
-                                self.selected_preset = first;
-                            }
-                        }
-                        self.presets_refresh_at = now + 2.0;
-                    }
-
-                    ui.horizontal(|ui| {
-                        egui::ComboBox::from_label("Preset")
-                            .selected_text(self.selected_preset.clone())
-                            .show_ui(ui, |ui| {
-                                for idx in 0..self.preset_names.len() {
-                                    let name = self.preset_names[idx].clone();
-                                    ui.selectable_value(
-                                        &mut self.selected_preset,
-                                        name.clone(),
-                                        &name,
-                                    );
-                                }
-                            });
-                        if ui.button("Load").clicked() && !self.selected_preset.is_empty() {
-                            if let Ok(preset) =
-                                crate::presets::load_preset(&self.selected_preset)
-                            {
-                                apply_preset(&self.params, &setter, &preset.values);
-                            }
-                        }
-                        if ui.button("Save").clicked() {
-                            self.save_name = self.selected_preset.clone();
-                            self.show_save_dialog = true;
-                        }
-                    });
-                });
-
                 if self.show_save_dialog {
                     egui::Window::new("Save Preset").show(ui.ctx(), |ui| {
                         ui.label("Preset name:");
                         ui.text_edit_singleline(&mut self.save_name);
                         ui.horizontal(|ui| {
                             if ui.button("OK").clicked() {
+                                let trimmed = self.save_name.trim().to_string();
+                                // Duplicate-name detection on the trimmed name,
+                                // using the same list the combo box shows.
+                                // Empty names fall through to the existing
+                                // direct-save path (unchanged behavior).
+                                if !trimmed.is_empty()
+                                    && self.preset_names.contains(&trimmed)
+                                {
+                                    // Do NOT write; open the overwrite confirm.
+                                    self.show_overwrite_confirm = true;
+                                } else {
+                                    let values = capture_preset(&self.params);
+                                    if crate::presets::save_preset(&self.save_name, values).is_ok()
+                                    {
+                                        self.selected_preset = self.save_name.clone();
+                                        // Force a rescan so the new file appears.
+                                        self.presets_refresh_at = f64::NEG_INFINITY;
+                                    }
+                                    self.show_save_dialog = false;
+                                }
+                            }
+                            if ui.button("Cancel").clicked() {
+                                self.show_save_dialog = false;
+                            }
+                        });
+                    });
+                }
+
+                if self.show_overwrite_confirm {
+                    egui::Window::new("Overwrite existing preset?").show(ui.ctx(), |ui| {
+                        ui.label(format!(
+                            "Preset \"{}\" already exists. Overwrite it?",
+                            self.save_name.trim()
+                        ));
+                        ui.horizontal(|ui| {
+                            if ui.button("Overwrite").clicked() {
                                 let values = capture_preset(&self.params);
                                 if crate::presets::save_preset(&self.save_name, values).is_ok()
                                 {
@@ -356,10 +389,11 @@ impl NiceEguiApp for ResoVoidEditor {
                                     // Force a rescan so the new file appears.
                                     self.presets_refresh_at = f64::NEG_INFINITY;
                                 }
+                                self.show_overwrite_confirm = false;
                                 self.show_save_dialog = false;
                             }
                             if ui.button("Cancel").clicked() {
-                                self.show_save_dialog = false;
+                                self.show_overwrite_confirm = false;
                             }
                         });
                     });

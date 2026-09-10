@@ -20,7 +20,7 @@ use dsp::suppressor::DspParams;
 use dsp::{AnalysisFrame, ResonanceSuppressor, BANDS};
 use gui::ResoVoidEditor;
 
-const WINDOW_SIZE: LogicalSize<f32> = LogicalSize::new(900.0, 560.0);
+const WINDOW_SIZE: LogicalSize<f32> = LogicalSize::new(1080.0, 672.0);
 
 /// Per-node filter shape. Backed by an IntParam (0/1/2) so host automation
 /// and patch recall keep working; the enum gives names instead of magic numbers.
@@ -522,6 +522,7 @@ impl Default for ResoVoid {
             selected_preset: String::new(),
             show_save_dialog: false,
             save_name: String::new(),
+            show_overwrite_confirm: false,
             presets_refresh_at: f64::NEG_INFINITY,
             dark_mode: false,
         };

@@ -119,6 +119,16 @@ pub(crate) fn load_preset_in(dir: &Path, name: &str) -> std::io::Result<Preset> 
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
 }
 
+/// Delete a preset by name (removes its `.json` file).
+pub fn delete_preset(name: &str) -> std::io::Result<()> {
+    delete_preset_in(&presets_dir(), name)
+}
+
+pub(crate) fn delete_preset_in(dir: &Path, name: &str) -> std::io::Result<()> {
+    let path = path_for(dir, name);
+    std::fs::remove_file(path)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -184,6 +194,57 @@ mod tests {
         let dir = tmp_dir("missing_file");
         std::fs::create_dir_all(&dir).unwrap();
         assert!(load_preset_in(&dir, "nope").is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn delete_removes_file_and_listing() {
+        let dir = tmp_dir("delete");
+        let mut values = HashMap::new();
+        values.insert("depth".to_string(), 0.5);
+        save_preset_in(&dir, "todelete", values).unwrap();
+        assert!(list_presets_in(&dir).contains(&"todelete".to_string()));
+        delete_preset_in(&dir, "todelete").unwrap();
+        assert!(!list_presets_in(&dir).contains(&"todelete".to_string()));
+        assert!(load_preset_in(&dir, "todelete").is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn delete_missing_is_err() {
+        let dir = tmp_dir("delete_missing");
+        std::fs::create_dir_all(&dir).unwrap();
+        assert!(delete_preset_in(&dir, "nope").is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn delete_traversal_cannot_escape_dir() {
+        let dir = tmp_dir("delete_traversal");
+        std::fs::create_dir_all(&dir).unwrap();
+        // Resolution must go through path_for: no separator survives and the
+        // resolved parent stays inside `dir`.
+        let p = path_for(&dir, "../evil");
+        assert!(!p
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .contains(std::path::MAIN_SEPARATOR));
+        let parent = p.parent().unwrap();
+        let canonical_dir = dir.canonicalize().unwrap();
+        // `dir` was just created so canonicalization succeeds; the (possibly
+        // non-existent) file's parent resolves to `dir` itself when made
+        // absolute, otherwise fall back to comparing against canonical dir.
+        let canonical_parent = if parent.exists() {
+            parent.canonicalize().unwrap()
+        } else {
+            canonical_dir.clone()
+        };
+        assert_eq!(canonical_parent, canonical_dir);
+        // Deleting the traversal name fails (no such file) and creates
+        // nothing outside `dir`.
+        assert!(delete_preset_in(&dir, "../evil").is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
