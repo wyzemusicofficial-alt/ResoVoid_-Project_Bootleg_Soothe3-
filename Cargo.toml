@@ -18,6 +18,8 @@ realfft = "3"
 atomic_float = "1.1"
 rtrb = "0.3.3"
 num-complex = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 
 [profile.release]
 lto = "thin"

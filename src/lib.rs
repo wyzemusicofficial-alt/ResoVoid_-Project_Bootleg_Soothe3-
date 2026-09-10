@@ -1,5 +1,6 @@
-﻿use std::sync::Arc;
+﻿// src/lib.rs
 use std::sync::atomic::Ordering;
+use std::sync::Arc;
 
 use atomic_float::AtomicF32;
 
@@ -13,12 +14,56 @@ use rtrb::RingBuffer;
 
 mod dsp;
 mod gui;
+mod presets;
 
-use dsp::{AnalysisFrame, BANDS, ResonanceSuppressor};
 use dsp::suppressor::DspParams;
+use dsp::{AnalysisFrame, ResonanceSuppressor, BANDS};
 use gui::ResoVoidEditor;
 
 const WINDOW_SIZE: LogicalSize<f32> = LogicalSize::new(900.0, 560.0);
+
+/// Per-node filter shape. Backed by an IntParam (0/1/2) so host automation
+/// and patch recall keep working; the enum gives names instead of magic numbers.
+#[derive(Enum, PartialEq, Clone, Copy, Debug)]
+pub enum NodeShape {
+    #[id = "bell"]
+    #[name = "Bell"]
+    Bell,
+    #[id = "lshelf"]
+    #[name = "Low Shelf"]
+    LowShelf,
+    #[id = "hshelf"]
+    #[name = "High Shelf"]
+    HighShelf,
+}
+
+impl NodeShape {
+    /// Index into the DSP's per-node shape arrays (matches node_shape() semantics).
+    pub fn to_dsp_index(self) -> usize {
+        match self {
+            NodeShape::Bell => 0,
+            NodeShape::LowShelf => 1,
+            NodeShape::HighShelf => 2,
+        }
+    }
+}
+
+/// Default center frequencies for the 8 preallocated node slots. Slots 0–2
+/// are enabled by default and preserve the original 200/2000/12000 Hz anchors.
+pub const NODE_DEFAULT_FREQS: [f32; 8] = [
+    200.0, 2000.0, 12000.0, 500.0, 1000.0, 4000.0, 8000.0, 16000.0,
+];
+
+/// Stereo gain-reduction coupling.
+#[derive(Enum, PartialEq, Clone, Copy, Debug)]
+pub enum StereoLink {
+    #[id = "linked"]
+    #[name = "Stereo Link"]
+    Linked,
+    #[id = "indep"]
+    #[name = "Independent"]
+    Independent,
+}
 
 #[derive(Params)]
 pub struct ResoVoidParams {
@@ -52,17 +97,141 @@ pub struct ResoVoidParams {
     #[id = "delt"]
     pub delta: BoolParam,
 
-    /// Low region depth multiplier (anchor: 200 Hz).
+    /// Node 1 depth multiplier.
     #[id = "node0"]
     pub node_depth_0: FloatParam,
 
-    /// Mid region depth multiplier (anchor: 2000 Hz).
+    /// Node 2 depth multiplier.
     #[id = "node1"]
     pub node_depth_1: FloatParam,
 
-    /// High region depth multiplier (anchor: 12000 Hz).
+    /// Node 3 depth multiplier.
     #[id = "node2"]
     pub node_depth_2: FloatParam,
+
+    /// Node 4 depth multiplier.
+    #[id = "node3"]
+    pub node_depth_3: FloatParam,
+
+    /// Node 5 depth multiplier.
+    #[id = "node4"]
+    pub node_depth_4: FloatParam,
+
+    /// Node 6 depth multiplier.
+    #[id = "node5"]
+    pub node_depth_5: FloatParam,
+
+    /// Node 7 depth multiplier.
+    #[id = "node6"]
+    pub node_depth_6: FloatParam,
+
+    /// Node 8 depth multiplier.
+    #[id = "node7"]
+    pub node_depth_7: FloatParam,
+
+    /// Node 1 center frequency in Hz.
+    #[id = "nf0"]
+    pub node_freq_0: FloatParam,
+
+    /// Node 2 center frequency in Hz.
+    #[id = "nf1"]
+    pub node_freq_1: FloatParam,
+
+    /// Node 3 center frequency in Hz.
+    #[id = "nf2"]
+    pub node_freq_2: FloatParam,
+
+    /// Node 4 center frequency in Hz.
+    #[id = "nf3"]
+    pub node_freq_3: FloatParam,
+
+    /// Node 5 center frequency in Hz.
+    #[id = "nf4"]
+    pub node_freq_4: FloatParam,
+
+    /// Node 6 center frequency in Hz.
+    #[id = "nf5"]
+    pub node_freq_5: FloatParam,
+
+    /// Node 7 center frequency in Hz.
+    #[id = "nf6"]
+    pub node_freq_6: FloatParam,
+
+    /// Node 8 center frequency in Hz.
+    #[id = "nf7"]
+    pub node_freq_7: FloatParam,
+
+    /// Node 1 enabled (deleting a node sets this false; param identity is kept).
+    #[id = "nen0"]
+    pub node_enabled_0: BoolParam,
+
+    /// Node 2 enabled.
+    #[id = "nen1"]
+    pub node_enabled_1: BoolParam,
+
+    /// Node 3 enabled.
+    #[id = "nen2"]
+    pub node_enabled_2: BoolParam,
+
+    /// Node 4 enabled.
+    #[id = "nen3"]
+    pub node_enabled_3: BoolParam,
+
+    /// Node 5 enabled.
+    #[id = "nen4"]
+    pub node_enabled_4: BoolParam,
+
+    /// Node 6 enabled.
+    #[id = "nen5"]
+    pub node_enabled_5: BoolParam,
+
+    /// Node 7 enabled.
+    #[id = "nen6"]
+    pub node_enabled_6: BoolParam,
+
+    /// Node 8 enabled.
+    #[id = "nen7"]
+    pub node_enabled_7: BoolParam,
+
+    /// Node 1 shape.
+    #[id = "nsh0"]
+    pub node_shape_0: EnumParam<NodeShape>,
+
+    /// Node 2 shape.
+    #[id = "nsh1"]
+    pub node_shape_1: EnumParam<NodeShape>,
+
+    /// Node 3 shape.
+    #[id = "nsh2"]
+    pub node_shape_2: EnumParam<NodeShape>,
+
+    /// Node 4 shape.
+    #[id = "nsh3"]
+    pub node_shape_3: EnumParam<NodeShape>,
+
+    /// Node 5 shape.
+    #[id = "nsh4"]
+    pub node_shape_4: EnumParam<NodeShape>,
+
+    /// Node 6 shape.
+    #[id = "nsh5"]
+    pub node_shape_5: EnumParam<NodeShape>,
+
+    /// Node 7 shape.
+    #[id = "nsh6"]
+    pub node_shape_6: EnumParam<NodeShape>,
+
+    /// Node 8 shape.
+    #[id = "nsh7"]
+    pub node_shape_7: EnumParam<NodeShape>,
+
+    /// Stereo link for gain reduction (linked = min of L/R per band).
+    #[id = "slnk"]
+    pub stereo_link: EnumParam<StereoLink>,
+
+    /// 2x internal oversampling for the biquad synthesis path.
+    #[id = "os2x"]
+    pub oversampling: BoolParam,
 }
 
 impl Default for ResoVoidParams {
@@ -74,13 +243,21 @@ impl Default for ResoVoidParams {
             sharpness: FloatParam::new("Sharpness", 0.5, FloatRange::Linear { min: 0.0, max: 1.0 })
                 .with_smoother(SmoothingStyle::Exponential(5.0)),
 
-            selectivity: FloatParam::new("Selectivity", 0.5, FloatRange::Linear { min: 0.0, max: 1.0 })
-                .with_smoother(SmoothingStyle::Exponential(5.0)),
+            selectivity: FloatParam::new(
+                "Selectivity",
+                0.5,
+                FloatRange::Linear { min: 0.0, max: 1.0 },
+            )
+            .with_smoother(SmoothingStyle::Exponential(5.0)),
 
             attack: FloatParam::new(
                 "Attack",
                 10.0,
-                FloatRange::Skewed { min: 0.1, max: 50.0, factor: 0.33 },
+                FloatRange::Skewed {
+                    min: 0.1,
+                    max: 50.0,
+                    factor: 0.33,
+                },
             )
             .with_unit(" ms")
             .with_smoother(SmoothingStyle::Exponential(5.0)),
@@ -88,7 +265,11 @@ impl Default for ResoVoidParams {
             release: FloatParam::new(
                 "Release",
                 100.0,
-                FloatRange::Skewed { min: 10.0, max: 500.0, factor: 0.33 },
+                FloatRange::Skewed {
+                    min: 10.0,
+                    max: 500.0,
+                    factor: 0.33,
+                },
             )
             .with_unit(" ms")
             .with_smoother(SmoothingStyle::Exponential(5.0)),
@@ -97,31 +278,204 @@ impl Default for ResoVoidParams {
                 .with_unit("%")
                 .with_smoother(SmoothingStyle::Linear(20.0)),
 
-            output_gain: FloatParam::new("Output", 0.0, FloatRange::Linear { min: -12.0, max: 12.0 })
-                .with_unit(" dB")
-                .with_smoother(SmoothingStyle::Exponential(5.0)),
+            output_gain: FloatParam::new(
+                "Output",
+                0.0,
+                FloatRange::Linear {
+                    min: -12.0,
+                    max: 12.0,
+                },
+            )
+            .with_unit(" dB")
+            .with_smoother(SmoothingStyle::Exponential(5.0)),
 
             fft_size: IntParam::new("FFT Size", 1, IntRange::Linear { min: 0, max: 3 })
-                .with_value_to_string(Arc::new(|v| match v {
-                    0 => "1024".to_string(),
-                    1 => "2048".to_string(),
-                    2 => "4096".to_string(),
-                    3 => "8192".to_string(),
-                    _ => format!("{v}"),
-                }
-                .to_string())),
+                .with_value_to_string(Arc::new(|v| {
+                    match v {
+                        0 => "1024".to_string(),
+                        1 => "2048".to_string(),
+                        2 => "4096".to_string(),
+                        3 => "8192".to_string(),
+                        _ => format!("{v}"),
+                    }
+                    .to_string()
+                })),
 
             soft_mode: BoolParam::new("Mode", false),
             delta: BoolParam::new("Delta", false),
 
-            node_depth_0: FloatParam::new("Node Low", 1.0, FloatRange::Linear { min: 0.0, max: 1.0 })
-                .with_smoother(SmoothingStyle::Linear(5.0)),
+            node_depth_0: FloatParam::new(
+                "Node Depth 1",
+                1.0,
+                FloatRange::Linear { min: 0.0, max: 1.0 },
+            )
+            .with_smoother(SmoothingStyle::Linear(5.0)),
 
-            node_depth_1: FloatParam::new("Node Mid", 1.0, FloatRange::Linear { min: 0.0, max: 1.0 })
-                .with_smoother(SmoothingStyle::Linear(5.0)),
+            node_depth_1: FloatParam::new(
+                "Node Depth 2",
+                1.0,
+                FloatRange::Linear { min: 0.0, max: 1.0 },
+            )
+            .with_smoother(SmoothingStyle::Linear(5.0)),
 
-            node_depth_2: FloatParam::new("Node High", 1.0, FloatRange::Linear { min: 0.0, max: 1.0 })
-                .with_smoother(SmoothingStyle::Linear(5.0)),
+            node_depth_2: FloatParam::new(
+                "Node Depth 3",
+                1.0,
+                FloatRange::Linear { min: 0.0, max: 1.0 },
+            )
+            .with_smoother(SmoothingStyle::Linear(5.0)),
+
+            node_depth_3: FloatParam::new(
+                "Node Depth 4",
+                1.0,
+                FloatRange::Linear { min: 0.0, max: 1.0 },
+            )
+            .with_smoother(SmoothingStyle::Linear(5.0)),
+
+            node_depth_4: FloatParam::new(
+                "Node Depth 5",
+                1.0,
+                FloatRange::Linear { min: 0.0, max: 1.0 },
+            )
+            .with_smoother(SmoothingStyle::Linear(5.0)),
+
+            node_depth_5: FloatParam::new(
+                "Node Depth 6",
+                1.0,
+                FloatRange::Linear { min: 0.0, max: 1.0 },
+            )
+            .with_smoother(SmoothingStyle::Linear(5.0)),
+
+            node_depth_6: FloatParam::new(
+                "Node Depth 7",
+                1.0,
+                FloatRange::Linear { min: 0.0, max: 1.0 },
+            )
+            .with_smoother(SmoothingStyle::Linear(5.0)),
+
+            node_depth_7: FloatParam::new(
+                "Node Depth 8",
+                1.0,
+                FloatRange::Linear { min: 0.0, max: 1.0 },
+            )
+            .with_smoother(SmoothingStyle::Linear(5.0)),
+
+            node_freq_0: FloatParam::new(
+                "Node Freq 1",
+                NODE_DEFAULT_FREQS[0],
+                FloatRange::Skewed {
+                    min: 20.0,
+                    max: 20000.0,
+                    factor: 0.3,
+                },
+            )
+            .with_unit(" Hz")
+            .with_smoother(SmoothingStyle::Linear(5.0)),
+
+            node_freq_1: FloatParam::new(
+                "Node Freq 2",
+                NODE_DEFAULT_FREQS[1],
+                FloatRange::Skewed {
+                    min: 20.0,
+                    max: 20000.0,
+                    factor: 0.3,
+                },
+            )
+            .with_unit(" Hz")
+            .with_smoother(SmoothingStyle::Linear(5.0)),
+
+            node_freq_2: FloatParam::new(
+                "Node Freq 3",
+                NODE_DEFAULT_FREQS[2],
+                FloatRange::Skewed {
+                    min: 20.0,
+                    max: 20000.0,
+                    factor: 0.3,
+                },
+            )
+            .with_unit(" Hz")
+            .with_smoother(SmoothingStyle::Linear(5.0)),
+
+            node_freq_3: FloatParam::new(
+                "Node Freq 4",
+                NODE_DEFAULT_FREQS[3],
+                FloatRange::Skewed {
+                    min: 20.0,
+                    max: 20000.0,
+                    factor: 0.3,
+                },
+            )
+            .with_unit(" Hz")
+            .with_smoother(SmoothingStyle::Linear(5.0)),
+
+            node_freq_4: FloatParam::new(
+                "Node Freq 5",
+                NODE_DEFAULT_FREQS[4],
+                FloatRange::Skewed {
+                    min: 20.0,
+                    max: 20000.0,
+                    factor: 0.3,
+                },
+            )
+            .with_unit(" Hz")
+            .with_smoother(SmoothingStyle::Linear(5.0)),
+
+            node_freq_5: FloatParam::new(
+                "Node Freq 6",
+                NODE_DEFAULT_FREQS[5],
+                FloatRange::Skewed {
+                    min: 20.0,
+                    max: 20000.0,
+                    factor: 0.3,
+                },
+            )
+            .with_unit(" Hz")
+            .with_smoother(SmoothingStyle::Linear(5.0)),
+
+            node_freq_6: FloatParam::new(
+                "Node Freq 7",
+                NODE_DEFAULT_FREQS[6],
+                FloatRange::Skewed {
+                    min: 20.0,
+                    max: 20000.0,
+                    factor: 0.3,
+                },
+            )
+            .with_unit(" Hz")
+            .with_smoother(SmoothingStyle::Linear(5.0)),
+
+            node_freq_7: FloatParam::new(
+                "Node Freq 8",
+                NODE_DEFAULT_FREQS[7],
+                FloatRange::Skewed {
+                    min: 20.0,
+                    max: 20000.0,
+                    factor: 0.3,
+                },
+            )
+            .with_unit(" Hz")
+            .with_smoother(SmoothingStyle::Linear(5.0)),
+
+            node_enabled_0: BoolParam::new("Node Enable 1", true),
+            node_enabled_1: BoolParam::new("Node Enable 2", true),
+            node_enabled_2: BoolParam::new("Node Enable 3", true),
+            node_enabled_3: BoolParam::new("Node Enable 4", false),
+            node_enabled_4: BoolParam::new("Node Enable 5", false),
+            node_enabled_5: BoolParam::new("Node Enable 6", false),
+            node_enabled_6: BoolParam::new("Node Enable 7", false),
+            node_enabled_7: BoolParam::new("Node Enable 8", false),
+
+            node_shape_0: EnumParam::new("Node Shape 1", NodeShape::Bell),
+            node_shape_1: EnumParam::new("Node Shape 2", NodeShape::Bell),
+            node_shape_2: EnumParam::new("Node Shape 3", NodeShape::Bell),
+            node_shape_3: EnumParam::new("Node Shape 4", NodeShape::Bell),
+            node_shape_4: EnumParam::new("Node Shape 5", NodeShape::Bell),
+            node_shape_5: EnumParam::new("Node Shape 6", NodeShape::Bell),
+            node_shape_6: EnumParam::new("Node Shape 7", NodeShape::Bell),
+            node_shape_7: EnumParam::new("Node Shape 8", NodeShape::Bell),
+
+            stereo_link: EnumParam::new("Stereo Link", StereoLink::Linked),
+            oversampling: BoolParam::new("Oversampling", false),
         }
     }
 }
@@ -154,7 +508,22 @@ impl Default for ResoVoid {
             centers: [0.0; BANDS],
             sample_rate: sample_rate_shared.clone(),
             gui_ctx: None,
-            node_positions: [1.0, 1.0, 1.0],
+            node_positions: [
+                (1.0, params.node_freq_0.value()),
+                (1.0, params.node_freq_1.value()),
+                (1.0, params.node_freq_2.value()),
+                (1.0, params.node_freq_3.value()),
+                (1.0, params.node_freq_4.value()),
+                (1.0, params.node_freq_5.value()),
+                (1.0, params.node_freq_6.value()),
+                (1.0, params.node_freq_7.value()),
+            ],
+            preset_names: Vec::new(),
+            selected_preset: String::new(),
+            show_save_dialog: false,
+            save_name: String::new(),
+            presets_refresh_at: f64::NEG_INFINITY,
+            dark_mode: false,
         };
 
         Self {
@@ -238,22 +607,10 @@ impl Plugin for ResoVoid {
         _aux: &mut AuxiliaryBuffers,
         context: &mut impl ProcessContext<Self>,
     ) -> ProcessStatus {
-        let dsp_params = DspParams {
-            depth: self.params.depth.smoothed.next(),
-            sharpness: self.params.sharpness.smoothed.next(),
-            selectivity: self.params.selectivity.smoothed.next(),
-            attack_ms: self.params.attack.smoothed.next(),
-            release_ms: self.params.release.smoothed.next(),
-            mix: self.params.mix.smoothed.next(),
-            soft_mode: self.params.soft_mode.value(),
-            delta_mode: self.params.delta.value(),
-            node_depths: [
-                self.params.node_depth_0.smoothed.next(),
-                self.params.node_depth_1.smoothed.next(),
-                self.params.node_depth_2.smoothed.next(),
-            ],
-        };
-        self.suppressor.set_params(dsp_params);
+        // MXCSR FTZ+DAZ is per-thread and the audio thread belongs to the
+        // host, so (re)assert it here rather than in initialize()/activate().
+        // One stmxcsr/ldmxcsr pair per block is negligible next to the DSP.
+        dsp::filters::enable_flush_to_zero();
 
         let idx = self.params.fft_size.value().clamp(0, 3) as usize;
         if idx != self.current_fft_index {
@@ -262,16 +619,84 @@ impl Plugin for ResoVoid {
             context.set_latency_samples(self.suppressor.latency() as u32);
         }
 
-        let output_gain_db = self.params.output_gain.smoothed.next();
-        let gain = dsp::suppressor::db_to_linear(output_gain_db);
+        let soft_mode = self.params.soft_mode.value();
+        let delta_mode = self.params.delta.value();
 
         let channels = buffer.as_slice();
         let num_samples = channels.first().map(|c| c.len()).unwrap_or(0);
         let num_channels = channels.len();
 
+        // Smoothers MUST advance once per sample: stepping them once per
+        // block ties the smoothing time to the host buffer size (a 512-sample
+        // block would finish a "5 ms" smoother ~512x too fast, producing
+        // zipper jumps instead of a glide). Per-sample stepping keeps the
+        // time constant host-independent at the cost of a few flops.
         for i in 0..num_samples {
-            let left = if num_channels >= 1 { channels[0][i] } else { 0.0 };
-            let right = if num_channels >= 2 { channels[1][i] } else { left };
+            self.suppressor.set_params(DspParams {
+                depth: self.params.depth.smoothed.next(),
+                sharpness: self.params.sharpness.smoothed.next(),
+                selectivity: self.params.selectivity.smoothed.next(),
+                attack_ms: self.params.attack.smoothed.next(),
+                release_ms: self.params.release.smoothed.next(),
+                mix: self.params.mix.smoothed.next(),
+                soft_mode,
+                delta_mode,
+                node_depths: [
+                    self.params.node_depth_0.smoothed.next(),
+                    self.params.node_depth_1.smoothed.next(),
+                    self.params.node_depth_2.smoothed.next(),
+                    self.params.node_depth_3.smoothed.next(),
+                    self.params.node_depth_4.smoothed.next(),
+                    self.params.node_depth_5.smoothed.next(),
+                    self.params.node_depth_6.smoothed.next(),
+                    self.params.node_depth_7.smoothed.next(),
+                ],
+                node_freqs: [
+                    self.params.node_freq_0.smoothed.next(),
+                    self.params.node_freq_1.smoothed.next(),
+                    self.params.node_freq_2.smoothed.next(),
+                    self.params.node_freq_3.smoothed.next(),
+                    self.params.node_freq_4.smoothed.next(),
+                    self.params.node_freq_5.smoothed.next(),
+                    self.params.node_freq_6.smoothed.next(),
+                    self.params.node_freq_7.smoothed.next(),
+                ],
+                node_shapes: [
+                    self.params.node_shape_0.value().to_dsp_index(),
+                    self.params.node_shape_1.value().to_dsp_index(),
+                    self.params.node_shape_2.value().to_dsp_index(),
+                    self.params.node_shape_3.value().to_dsp_index(),
+                    self.params.node_shape_4.value().to_dsp_index(),
+                    self.params.node_shape_5.value().to_dsp_index(),
+                    self.params.node_shape_6.value().to_dsp_index(),
+                    self.params.node_shape_7.value().to_dsp_index(),
+                ],
+                node_enabled: [
+                    self.params.node_enabled_0.value(),
+                    self.params.node_enabled_1.value(),
+                    self.params.node_enabled_2.value(),
+                    self.params.node_enabled_3.value(),
+                    self.params.node_enabled_4.value(),
+                    self.params.node_enabled_5.value(),
+                    self.params.node_enabled_6.value(),
+                    self.params.node_enabled_7.value(),
+                ],
+                stereo_linked: self.params.stereo_link.value() == StereoLink::Linked,
+                oversampling: self.params.oversampling.value(),
+            });
+
+            let gain = dsp::suppressor::db_to_linear(self.params.output_gain.smoothed.next());
+
+            let left = if num_channels >= 1 {
+                channels[0][i]
+            } else {
+                0.0
+            };
+            let right = if num_channels >= 2 {
+                channels[1][i]
+            } else {
+                left
+            };
 
             let (out_left, out_right) = self.suppressor.process_sample(left, right);
 
@@ -302,10 +727,8 @@ impl ClapPlugin for ResoVoid {
 
 impl Vst3Plugin for ResoVoid {
     const VST3_CLASS_ID: [u8; 16] = *b"ResoVoidWowNice!";
-    const VST3_SUBCATEGORIES: &'static [Vst3SubCategory] = &[
-        Vst3SubCategory::Fx,
-        Vst3SubCategory::Dynamics,
-    ];
+    const VST3_SUBCATEGORIES: &'static [Vst3SubCategory] =
+        &[Vst3SubCategory::Fx, Vst3SubCategory::Dynamics];
 }
 
 nice_export_clap!(ResoVoid);

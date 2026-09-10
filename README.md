@@ -4,9 +4,11 @@ Dynamic Resonance Suppressor - A Soothe2-inspired spectral processing plugin bui
 
 ## Features
 
-- **Real-time spectral processing** using STFT-style analysis (Hann-windowed real FFT, non-overlapping windows) to drive a per-band reduction
-- **Intelligent resonance detection** via a slow spectral baseline follower with a selectivity-dependent threshold
+- **Real-time spectral processing** using STFT-style analysis (Hann-windowed real FFT, 50%-overlap windows) to drive a per-band reduction
+- **Intelligent resonance detection** via a spectral-median reference (13-band window) with a selectivity-dependent threshold — sustained peaks stay flagged, not just onsets
 - **Per-band dynamic suppression** with attack/release timing applied to both the baseline and the gain reduction
+- **8 Soothe-style nodes** (freq × depth, Bell/Low/High-Shelf) scaling depth per region, with draggable spectrum markers
+- **Stereo Link / Independent** coupling, **2× oversampling** (synthesis path), **FFT-size select** (1024–8192), **named JSON presets**
 - **Soft/Hard modes** for different suppression characteristics
 - **Delta monitoring** to hear only what's being removed
 - **Modern GUI** with real-time spectrum visualization
@@ -23,6 +25,10 @@ Dynamic Resonance Suppressor - A Soothe2-inspired spectral processing plugin bui
 | Release | How fast suppression releases | 10-500ms |
 | Mode | Soft (smooth) vs Hard (aggressive) | Toggle |
 | Delta | Listen to removed content only | Toggle |
+| FFT Size | Analysis window (1024/2048/4096/8192) | Select |
+| Stereo Link | Linked (min per band) vs Independent | Toggle |
+| Oversampling | 2× on biquad synthesis path | Toggle |
+| Nodes 1–8 | Per-region depth × freq, Bell/Shelf, enable | Drag markers / params |
 | Mix | Dry/wet blend | 0-100% |
 | Output | Output gain | ±12dB |
 
@@ -40,11 +46,11 @@ This will create VST3 and CLAP plugins in the `target/bundled` directory.
 
 ### Spectral Processing Pipeline
 
-1. **STFT Analysis**: Audio is buffered into non-overlapping windows, Hann-windowed, and transformed to the frequency domain with a real FFT (`realfft`).
-2. **Resonance Detection**: Each band's level is compared against a slow-moving baseline (attack/release follower). Excess above `baseline + threshold` (threshold shrinks with Selectivity) triggers downward gain reduction.
+1. **STFT Analysis**: Audio fills a ring buffer; every hop (half the FFT size) the latest window is Hann-windowed and transformed with a real FFT (`realfft`).
+2. **Resonance Detection**: Each band's level is compared against a spectral-median reference (median of ±6 neighboring bands at the same instant, lightly smoothed over time). Excess above `reference + threshold` (threshold shrinks with Selectivity), scaled by the node-shape depth multiplier at that frequency, triggers downward gain reduction.
 3. **Gain Calculation**: The excess is scaled by Depth/Sharpness into a reduction in dB, converted to a linear per-band gain (≤ 1.0).
 4. **Temporal Dynamics**: Attack/Release ballistics are applied to both the baseline follower and the final gain, preventing zipper noise when coefficients change.
-5. **Gain Synthesis**: There is **no inverse FFT**. The actual audio path is a cascade of 64 peaking biquads (one per log-spaced band) whose coefficients are updated once per analysis window. The dry signal is delayed by one analysis window (look-ahead) so the reduction lands on the audio that produced the spectrum. AIUI: analysis and synthesis are fully decoupled — no IFFT/overlap-add reconstruction exists anywhere in the codebase.
+5. **Gain Synthesis**: There is **no inverse FFT**. The actual audio path is a cascade of 64 peaking biquads (one per log-spaced band) whose coefficients are updated every analysis hop (twice per window). The dry signal is delayed by one analysis window (look-ahead) so the reduction lands on the audio that produced the spectrum. AIUI: analysis and synthesis are fully decoupled — no IFFT/overlap-add reconstruction exists anywhere in the codebase.
 
 ### FFT Settings
 
@@ -57,7 +63,7 @@ This will create VST3 and CLAP plugins in the `target/bundled` directory.
 
 ### Design Notes
 
-- **Non-overlapping analysis windows**: The analysis stage collects one full FFT-size block before computing a spectrum and updating gains (no hop/overlap-add). This is a deliberate tradeoff — it is cheaper and the per-band biquad cascade smooths gain changes between updates. Detection therefore refreshes once per window (e.g. ~46 ms at 2048/44.1 kHz) rather than every hop. Overlapping analysis is a possible future enhancement but is intentionally not implemented here.
+- **50%-overlap analysis windows**: The analysis stage keeps a ring buffer and emits a Hann-windowed spectrum every hop = FFT-size / 2 samples (Hann @ 50% is COLA). Detection therefore refreshes twice per window (e.g. ~23 ms at 2048/44.1 kHz). Output-path latency is unchanged — it is set by the delay line (one full window), not by the hop.
 - **Latency is genuine**: the plugin reports exactly one analysis window of latency to the host, because the dry signal is buffered by that amount (see look-ahead above). Host delay compensation will therefore stay correct.
 
 ## License

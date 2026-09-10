@@ -1770,6 +1770,8 @@ dependencies = [
  "num-complex",
  "realfft",
  "rtrb",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

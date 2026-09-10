@@ -1,10 +1,11 @@
-﻿use rtrb::Producer;
+﻿// src/dsp/suppressor.rs
+use rtrb::Producer;
 
 use crate::dsp::analysis::{AnalysisEngine, AnalysisFrame};
 use crate::dsp::bands::compute_band_layout;
 use crate::dsp::detector::{DetectParams, Detector};
 use crate::dsp::filters::BandProcessor;
-use crate::dsp::BANDS;
+use crate::dsp::{BANDS, MAX_NODES};
 
 #[derive(Clone, Copy)]
 pub struct DspParams {
@@ -16,9 +17,19 @@ pub struct DspParams {
     pub mix: f32,
     pub soft_mode: bool,
     pub delta_mode: bool,
-    /// Per-region depth multipliers: [Low, Mid, High] at anchors 200 Hz, 2000 Hz, 12000 Hz.
+    /// Per-region depth multipliers, one per node slot.
     /// Each value 0.0..1.0 attenuates the global depth in that frequency neighborhood.
-    pub node_depths: [f32; 3],
+    pub node_depths: [f32; MAX_NODES],
+    /// Per-node center frequencies in Hz, one per node slot.
+    pub node_freqs: [f32; MAX_NODES],
+    /// Per-node shapes: 0 = Bell, 1 = Low Shelf, 2 = High Shelf.
+    pub node_shapes: [usize; MAX_NODES],
+    /// Per-node enabled flags. Disabled slots contribute zero weight.
+    pub node_enabled: [bool; MAX_NODES],
+    /// Stereo link: both channels use `min(gains_l, gains_r)` per band.
+    pub stereo_linked: bool,
+    /// 2x internal oversampling for the biquad synthesis path only.
+    pub oversampling: bool,
 }
 
 impl Default for DspParams {
@@ -32,7 +43,14 @@ impl Default for DspParams {
             mix: 1.0,
             soft_mode: false,
             delta_mode: false,
-            node_depths: [1.0, 1.0, 1.0],
+            node_depths: [1.0; MAX_NODES],
+            node_freqs: [
+                200.0, 2000.0, 12000.0, 500.0, 1000.0, 4000.0, 8000.0, 16000.0,
+            ],
+            node_shapes: [0; MAX_NODES],
+            node_enabled: [true, true, true, false, false, false, false, false],
+            stereo_linked: true,
+            oversampling: false,
         }
     }
 }
@@ -54,9 +72,11 @@ struct ChannelState {
 impl ChannelState {
     fn new(fft_size: usize, sample_rate: f32) -> Self {
         let layout = compute_band_layout(fft_size, sample_rate);
+        let analysis = AnalysisEngine::new(fft_size, sample_rate);
+        let hop = analysis.hop();
         Self {
-            analysis: AnalysisEngine::new(fft_size, sample_rate),
-            detector: Detector::new(fft_size, sample_rate),
+            analysis,
+            detector: Detector::new(hop, sample_rate),
             bands: BandProcessor::new(layout, sample_rate),
             delay: DelayLine::new(fft_size),
         }
@@ -135,6 +155,10 @@ pub struct ResonanceSuppressor {
     detect_params: DetectParams,
     mix: f32,
     delta_mode: bool,
+    stereo_linked: bool,
+    oversampling: bool,
+    /// Most recently applied per-channel gains (drives the 2x biquad path).
+    applied_gains: [[f32; BANDS]; 2],
     sample_rate: f32,
     viz_producer: Producer<AnalysisFrame>,
     /// Linear crossfade ramp: counts down from CROSSFADE_LEN to 0 after an
@@ -146,11 +170,17 @@ pub struct ResonanceSuppressor {
 impl ResonanceSuppressor {
     pub fn new(sample_rate: f32, viz_producer: Producer<AnalysisFrame>) -> Self {
         Self {
-            channels: [ChannelBundle::new(sample_rate), ChannelBundle::new(sample_rate)],
+            channels: [
+                ChannelBundle::new(sample_rate),
+                ChannelBundle::new(sample_rate),
+            ],
             fft_index: 1,
             detect_params: DetectParams::default(),
             mix: 1.0,
             delta_mode: false,
+            stereo_linked: true,
+            oversampling: false,
+            applied_gains: [[1.0; BANDS]; 2],
             sample_rate,
             viz_producer,
             crossfade_remaining: 0,
@@ -166,7 +196,10 @@ impl ResonanceSuppressor {
             return;
         }
         self.sample_rate = sample_rate;
-        self.channels = [ChannelBundle::new(sample_rate), ChannelBundle::new(sample_rate)];
+        self.channels = [
+            ChannelBundle::new(sample_rate),
+            ChannelBundle::new(sample_rate),
+        ];
         // Fresh delay/analysis state means the same discontinuity as an
         // FFT-size switch, so ramp the output identically.
         self.crossfade_remaining = CROSSFADE_LEN;
@@ -189,14 +222,20 @@ impl ResonanceSuppressor {
         self.detect_params.release_ms = p.release_ms.max(1.0);
         self.detect_params.soft_mode = p.soft_mode;
         self.detect_params.node_depths = p.node_depths;
+        self.detect_params.node_freqs = p.node_freqs;
+        self.detect_params.node_shapes = p.node_shapes;
+        self.detect_params.node_enabled = p.node_enabled;
         self.mix = p.mix.clamp(0.0, 1.0);
         self.delta_mode = p.delta_mode;
+        self.stereo_linked = p.stereo_linked;
+        self.oversampling = p.oversampling;
     }
 
     pub fn reset(&mut self) {
         for ch in &mut self.channels {
             ch.reset();
         }
+        self.applied_gains = [[1.0; BANDS]; 2];
         self.crossfade_remaining = 0;
     }
 
@@ -204,21 +243,89 @@ impl ResonanceSuppressor {
     pub fn process_sample(&mut self, left: f32, right: f32) -> (f32, f32) {
         let idx = self.fft_index;
         let params = self.detect_params;
+        let linked = self.stereo_linked;
+        let oversampled = self.oversampling;
 
-        let (wet_l, dry_l, frame_l) =
-            Self::process_channel(&mut self.channels[0], idx, left, params);
-        let (wet_r, dry_r, _frame_r) =
-            Self::process_channel(&mut self.channels[1], idx, right, params);
+        // Both detectors run first (analysis only — no gain application yet)
+        // so the stereo link can see both channels' gains before either
+        // channel's biquads consume them.
+        let (dry_l, frame_l) = Self::process_channel(&mut self.channels[0], idx, left, params);
+        let (dry_r, frame_r) = Self::process_channel(&mut self.channels[1], idx, right, params);
 
-        if let Some((levels, gains)) = frame_l {
-            let centers = self.channels[0].states[idx].analysis.bands().centers;
-            let _ = self.viz_producer.push(AnalysisFrame {
-                spectrum: levels,
-                reduction: gains,
-                centers,
-                sample_rate: self.sample_rate,
-            });
+        // Apply fresh detector gains. Both channels share the same hop, so in
+        // practice frames arrive in lockstep; the one-sided arms are defensive
+        // (a channel with no new frame keeps its previous coefficients).
+        match (frame_l, frame_r) {
+            (Some((levels, gains_l)), Some((_, gains_r))) => {
+                let (app_l, app_r) = if linked {
+                    let m = linked_gains(&gains_l, &gains_r);
+                    (m, m)
+                } else {
+                    (gains_l, gains_r)
+                };
+                self.apply_gains(0, idx, &app_l, oversampled);
+                self.apply_gains(1, idx, &app_r, oversampled);
+                self.applied_gains = [app_l, app_r];
+                let centers = self.channels[0].states[idx].analysis.bands().centers;
+                let _ = self.viz_producer.push(AnalysisFrame {
+                    spectrum: levels,
+                    reduction: app_l,
+                    centers,
+                    sample_rate: self.sample_rate,
+                });
+            }
+            (Some((levels, gains_l)), None) => {
+                self.apply_gains(0, idx, &gains_l, oversampled);
+                self.applied_gains[0] = gains_l;
+                let centers = self.channels[0].states[idx].analysis.bands().centers;
+                let _ = self.viz_producer.push(AnalysisFrame {
+                    spectrum: levels,
+                    reduction: gains_l,
+                    centers,
+                    sample_rate: self.sample_rate,
+                });
+            }
+            (None, Some((levels, gains_r))) => {
+                self.apply_gains(1, idx, &gains_r, oversampled);
+                self.applied_gains[1] = gains_r;
+                let centers = self.channels[0].states[idx].analysis.bands().centers;
+                let _ = self.viz_producer.push(AnalysisFrame {
+                    spectrum: levels,
+                    reduction: self.applied_gains[0],
+                    centers,
+                    sample_rate: self.sample_rate,
+                });
+            }
+            (None, None) => {
+                // No new detector data: still propagate a toggled oversampling
+                // flag so coefficients get recomputed at the new rate.
+                self.channels[0].states[idx]
+                    .bands
+                    .set_oversampled(oversampled);
+                self.channels[1].states[idx]
+                    .bands
+                    .set_oversampled(oversampled);
+            }
         }
+
+        let wet_l = {
+            let st = &mut self.channels[0].states[idx];
+            let g = self.applied_gains[0];
+            if oversampled {
+                st.bands.process_sample_2x(dry_l, &g)
+            } else {
+                st.bands.process_sample(dry_l)
+            }
+        };
+        let wet_r = {
+            let st = &mut self.channels[1].states[idx];
+            let g = self.applied_gains[1];
+            if oversampled {
+                st.bands.process_sample_2x(dry_r, &g)
+            } else {
+                st.bands.process_sample(dry_r)
+            }
+        };
 
         let out_l = apply_io(dry_l, wet_l, self.mix, self.delta_mode);
         let out_r = apply_io(dry_r, wet_r, self.mix, self.delta_mode);
@@ -237,25 +344,47 @@ impl ResonanceSuppressor {
         }
     }
 
+    /// Run analysis + detection for one channel. Returns the delay-compensated
+    /// dry sample plus fresh detector output when a new analysis frame fired.
+    /// Gain application is deliberately left to the caller (`process_sample`)
+    /// so stereo linking can combine both channels first.
     #[inline]
     fn process_channel(
         ch: &mut ChannelBundle,
         idx: usize,
         x: f32,
         params: DetectParams,
-    ) -> (f32, f32, Option<([f32; BANDS], [f32; BANDS])>) {
+    ) -> (f32, Option<([f32; BANDS], [f32; BANDS])>) {
         let st = &mut ch.states[idx];
         let mut frame = None;
         if let Some(levels) = st.analysis.process_sample(x) {
             let band_centers = st.analysis.bands().centers;
             let gains = st.detector.process_frame(&levels, &params, &band_centers);
-            st.bands.set_gains(&gains);
             frame = Some((levels, gains));
         }
         let dry = st.delay.push_pop(x);
-        let wet = st.bands.process_sample(dry);
-        (wet, dry, frame)
+        (dry, frame)
     }
+
+    /// Push fresh gains into one channel's biquad cascade, propagating the
+    /// oversampling flag first so coefficients compute at the right rate.
+    #[inline]
+    fn apply_gains(&mut self, ch: usize, idx: usize, gains: &[f32; BANDS], oversampled: bool) {
+        let bands = &mut self.channels[ch].states[idx].bands;
+        bands.set_oversampled(oversampled);
+        bands.set_gains(gains);
+    }
+}
+
+/// Stereo link: per-band minimum (the more aggressive reduction wins on both
+/// channels). Stack-allocated, no heap.
+#[inline]
+fn linked_gains(a: &[f32; BANDS], b: &[f32; BANDS]) -> [f32; BANDS] {
+    let mut out = [1.0f32; BANDS];
+    for i in 0..BANDS {
+        out[i] = a[i].min(b[i]);
+    }
+    out
 }
 
 #[inline]
@@ -364,21 +493,30 @@ mod tests {
     }
 
     #[test]
-    fn analysis_non_overlapping_windows() {
+    fn analysis_overlaps_by_half_hop() {
+        // 50% overlap: after the first full window, a frame is emitted every
+        // hop = fft/2 samples, not every fft samples. This test replaces the
+        // old non-overlapping-windows expectation.
         let fft = 32;
+        let hop = fft / 2;
         let mut eng = AnalysisEngine::new(fft, 44100.0);
+        assert_eq!(eng.hop(), hop);
         // First window → Some.
         for _ in 0..fft - 1 {
             eng.process_sample(0.0);
         }
         assert!(eng.process_sample(0.0).is_some());
-        // Immediately after, the next fft-1 samples should be None (new window).
-        for i in 0..fft - 1 {
+        // Next hop-1 samples → None, then the overlapped frame → Some.
+        for i in 0..hop - 1 {
             assert!(
                 eng.process_sample(0.0).is_none(),
-                "None during second window at sample {i}"
+                "None during hop at sample {i}"
             );
         }
+        assert!(
+            eng.process_sample(0.0).is_some(),
+            "overlapped frame expected after one hop of {hop}"
+        );
     }
 
     #[test]
@@ -407,7 +545,11 @@ mod tests {
         }
         let levels = eng.process_sample(1.0).unwrap();
         // The lowest-frequency band should have significant energy.
-        assert!(levels[0] > -20.0, "DC should register in band 0, got {}", levels[0]);
+        assert!(
+            levels[0] > -20.0,
+            "DC should register in band 0, got {}",
+            levels[0]
+        );
     }
 
     // --------------------------------------------------- Crossfade behaviour
@@ -524,6 +666,62 @@ mod tests {
         assert_eq!(sup.crossfade_remaining, 0);
         sup.set_sample_rate(48000.0);
         assert_eq!(sup.crossfade_remaining, CROSSFADE_LEN);
+    }
+
+    #[test]
+    fn linked_gains_takes_per_band_minimum() {
+        let mut a = [1.0f32; BANDS];
+        let mut b = [1.0f32; BANDS];
+        a[3] = 0.5;
+        b[3] = 0.8;
+        a[7] = 0.9;
+        b[7] = 0.2;
+        let m = super::linked_gains(&a, &b);
+        assert!((m[3] - 0.5).abs() < 1e-9, "left more aggressive wins");
+        assert!((m[7] - 0.2).abs() < 1e-9, "right more aggressive wins");
+        assert!((m[0] - 1.0).abs() < 1e-9, "unity elsewhere");
+    }
+
+    #[test]
+    fn stereo_link_couples_channels_end_to_end() {
+        // One-sided resonance: loud sine left, silence right.
+        let run = |linked: bool| -> [[f32; BANDS]; 2] {
+            let (tx, _rx) = rtrb::RingBuffer::<AnalysisFrame>::new(64);
+            let mut sup = ResonanceSuppressor::new(44100.0, tx);
+            sup.set_params(DspParams {
+                depth: 1.0,
+                selectivity: 1.0,
+                stereo_linked: linked,
+                ..DspParams::default()
+            });
+            for n in 0..16384 {
+                let l = 0.5 * (2.0 * std::f32::consts::PI * 440.0 * n as f32 / 44100.0).sin();
+                sup.process_sample(l, 0.0);
+            }
+            sup.applied_gains
+        };
+        let linked = run(true);
+        // Left channel must be reducing somewhere.
+        assert!(
+            linked[0].iter().any(|&g| g < 0.95),
+            "left channel should reduce a 440 Hz resonance"
+        );
+        // Linked: both channels carry identical gains.
+        for i in 0..BANDS {
+            assert!(
+                (linked[0][i] - linked[1][i]).abs() < 1e-9,
+                "linked gains must match on both channels at band {i}"
+            );
+        }
+        let indep = run(false);
+        assert!(
+            indep[0].iter().any(|&g| g < 0.95),
+            "left channel should still reduce when unlinked"
+        );
+        assert!(
+            indep[1].iter().all(|&g| (g - 1.0).abs() < 1e-3),
+            "silent right channel must stay at unity when unlinked"
+        );
     }
 
     #[test]

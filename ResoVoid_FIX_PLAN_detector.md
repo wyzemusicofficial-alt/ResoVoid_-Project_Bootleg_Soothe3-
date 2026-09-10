@@ -1,5 +1,12 @@
 # Fix Plan: Resonance Suppressor Has No Audible Effect
 
+> STATUS (2026-09-10): **RESOLVED — implemented in `src/dsp/detector.rs`.**
+> `process_frame` now computes a per-frame `spectral_median()` (half-window 6,
+> 13 bands, allocation-free) and smooths *toward the median*, not the band's own
+> level. Unit tests (`spectral_median_is_robust_to_outlier`, detector hold tests)
+> + full `cargo test` (54 passed) green. Remaining work is ear-testing on
+> sustained resonant material + Delta-mode spot-check, not code.
+
 Companion to `PROJECT_CONTEXT.md`. This file is scoped to one specific,
 user-confirmed bug: **ResoVoid produces no audible change to the source
 material**, even with Depth/Selectivity pushed to extremes. This document

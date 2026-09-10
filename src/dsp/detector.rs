@@ -8,7 +8,7 @@
 // follows the *spectral median* (not the band's raw level) to avoid jitter
 // without "learning" a sustained resonance as normal. See ResoVoid_FIX_PLAN_detector.md.
 
-use crate::dsp::BANDS;
+use crate::dsp::{BANDS, MAX_NODES};
 
 /// Half-window radius for the spectral median (total window = 2*R+1 = 13 bands).
 const MEDIAN_HALF_WINDOW: usize = 6;
@@ -21,8 +21,15 @@ pub struct DetectParams {
     pub attack_ms: f32,
     pub release_ms: f32,
     pub soft_mode: bool,
-    /// Per-region depth multipliers: [Low, Mid, High] at anchors 200 Hz, 2000 Hz, 12000 Hz.
-    pub node_depths: [f32; 3],
+    /// Per-region depth multipliers, one per node slot.
+    pub node_depths: [f32; MAX_NODES],
+    /// Per-node center frequencies in Hz, one per node slot.
+    pub node_freqs: [f32; MAX_NODES],
+    /// Per-node shapes: 0 = Bell, 1 = Low Shelf, 2 = High Shelf.
+    pub node_shapes: [usize; MAX_NODES],
+    /// Per-node enabled flags. A disabled node is truly absent from the
+    /// calculation (zero weight), not a neutral-depth anchor.
+    pub node_enabled: [bool; MAX_NODES],
 }
 
 impl Default for DetectParams {
@@ -34,24 +41,139 @@ impl Default for DetectParams {
             attack_ms: 10.0,
             release_ms: 100.0,
             soft_mode: false,
-            node_depths: [1.0, 1.0, 1.0],
+            node_depths: [1.0; MAX_NODES],
+            node_freqs: [200.0, 2000.0, 12000.0, 500.0, 1000.0, 4000.0, 8000.0, 16000.0],
+            node_shapes: [0; MAX_NODES],
+            node_enabled: [true, true, true, false, false, false, false, false],
         }
+    }
+}
+
+/// Gaussian sigma in octaves for the node-shape kernel.
+///
+/// Chosen relative to the ~10-octave display/audible range (20 Hz–20 kHz =
+/// log2(1000) ≈ 10 octaves): σ = 1.0 octave, i.e. roughly one tenth of the
+/// total range, so each node's influence visibly bows across 2–4 octaves
+/// (±2σ = ±2 octaves ≈ 40% of the display) the way Soothe-style curves do.
+///
+/// Reference weights with σ = 1.0:
+/// At ±1 octave:  w ≈ 0.607
+/// At ±2 octaves: w ≈ 0.135
+/// At ±3 octaves: w ≈ 0.011  (effectively gone)
+/// At ±4 octaves: w ≈ 0.0003 (numerical zero)
+///
+/// (The earlier σ = 0.425 matched the old triangular kernel's -6 dB point at
+/// ±0.5 octave; it was deliberately widened here so transitions bow gently
+/// over several octaves instead of steepening within one.)
+const NODE_SHAPE_SIGMA: f32 = 1.0;
+
+/// Compute the per-region depth multiplier for a single frequency.
+///
+/// Blends between the Gaussian-weighted node average and a neutral baseline
+/// of 1.0 (no extra attenuation) based on how much total node weight is
+/// actually present at `freq`:
+///
+/// ```text
+/// node_avg = weighted_sum / total_weight        // what the nodes say
+/// coverage = total_weight.clamp(0.0, 1.0)       // how much they say it
+/// result   = coverage * node_avg + (1 - coverage) * 1.0
+/// ```
+///
+/// Design choice: the normalizing constant 1.0 is the on-axis weight of a
+/// single isolated node, so `coverage` measures "node influence present" in
+/// units of one fully-engaged node.  At an anchor, coverage ≈ 1 and the
+/// result is the node average; far from every node, coverage → 0 and the
+/// result relaxes to neutral 1.0 instead of saturating to the nearest node's
+/// raw value.  In a gap between two distant nodes the curve sags gently back
+/// toward neutral rather than forming a plateau or a wall.
+///
+/// The `total_weight <= 1e-6` fallback returns exact neutral 1.0 and exists
+/// only for float safety — with a Gaussian kernel it should not trigger in
+/// practice.
+///
+/// This is the single source of truth used by both the DSP detector
+/// and the GUI shape curve — never duplicate this math elsewhere.
+///
+/// Shape semantics (0 = Bell, 1 = Low Shelf, 2 = High Shelf):
+/// - **Bell**: symmetric Gaussian falloff on both sides of the anchor.
+/// - **Low Shelf**: full influence (w = 1) below the anchor, Gaussian
+///   falloff above — the node "holds down" everything to its left.
+/// - **High Shelf**: full influence (w = 1) above the anchor, Gaussian
+///   falloff below — the node "holds down" everything to its right.
+///
+/// A disabled slot (`node_enabled[j] == false`) contributes zero weight —
+/// it is skipped entirely, so deleting a node removes its influence rather
+/// than leaving behind a neutral anchor.
+pub fn node_shape(
+    freq: f32,
+    node_freqs: &[f32; MAX_NODES],
+    node_depths: &[f32; MAX_NODES],
+    node_shapes: &[usize; MAX_NODES],
+    node_enabled: &[bool; MAX_NODES],
+) -> f32 {
+    let band_log = freq.max(1.0).log2();
+    let mut weighted_sum = 0.0f32;
+    let mut total_weight = 0.0f32;
+    for j in 0..MAX_NODES {
+        if !node_enabled[j] {
+            continue;
+        }
+        let anchor_log = node_freqs[j].log2();
+        let dist_octaves = band_log - anchor_log;
+
+        // Shape-dependent weight:
+        //   Bell (0): Gaussian on both sides (abs dist).
+        //   Low Shelf (1): full weight below anchor, Gaussian above.
+        //   High Shelf (2): full weight above anchor, Gaussian below.
+        let w = match node_shapes[j] {
+            1 => {
+                // Low shelf: full influence below anchor.
+                if dist_octaves <= 0.0 {
+                    1.0
+                } else {
+                    (-0.5 * (dist_octaves / NODE_SHAPE_SIGMA).powi(2)).exp()
+                }
+            }
+            2 => {
+                // High shelf: full influence above anchor.
+                if dist_octaves >= 0.0 {
+                    1.0
+                } else {
+                    (-0.5 * (dist_octaves / NODE_SHAPE_SIGMA).powi(2)).exp()
+                }
+            }
+            _ => {
+                // Bell (default): symmetric Gaussian.
+                (-0.5 * (dist_octaves.abs() / NODE_SHAPE_SIGMA).powi(2)).exp()
+            }
+        };
+        weighted_sum += node_depths[j] * w;
+        total_weight += w;
+    }
+    if total_weight > 1e-6 {
+        let node_avg = weighted_sum / total_weight;
+        let coverage = total_weight.clamp(0.0, 1.0);
+        coverage * node_avg + (1.0 - coverage) * 1.0
+    } else {
+        1.0
     }
 }
 
 pub struct Detector {
     sample_rate: f32,
-    frame_samples: f32,
+    /// Samples between consecutive frames (the analysis hop, not the FFT
+    /// size). Drives all per-frame follower timing via `coef()`.
+    frame_hop: f32,
     /// Smoothed spectral reference (follows the per-frame median, not raw level).
     baseline: [f32; BANDS],
     gain: [f32; BANDS],
 }
 
 impl Detector {
-    pub fn new(fft_size: usize, sample_rate: f32) -> Self {
+    pub fn new(frame_hop: usize, sample_rate: f32) -> Self {
         Self {
             sample_rate,
-            frame_samples: fft_size as f32,
+            frame_hop: frame_hop as f32,
             baseline: [0.0; BANDS],
             gain: [1.0; BANDS],
         }
@@ -67,12 +189,12 @@ impl Detector {
     /// short), consider moving the follower to per-sample operation.
     ///
     /// The 3 node_depths act as per-region depth attenuators — dragging a node
-    /// down reduces suppression in that frequency neighborhood. This is NOT full
-    /// per-band automation. It's 3 fixed-frequency region multipliers on the
-    /// global depth parameter.
+    /// down reduces suppression in that frequency neighborhood. The 3 node_freqs
+    /// set the center frequency of each region. Gaussian weights in octave-distance
+    /// space provide smooth, C∞ interpolation between regions.
     #[inline]
     pub fn process_frame(&mut self, levels_db: &[f32; BANDS], p: &DetectParams, band_centers: &[f32; BANDS]) -> [f32; BANDS] {
-        let frame_time = self.frame_samples / self.sample_rate;
+        let frame_time = self.frame_hop / self.sample_rate;
 
         let baseline_attack = coef(p.attack_ms, frame_time);
         let baseline_release = coef(p.release_ms, frame_time);
@@ -83,34 +205,18 @@ impl Detector {
         let thr = (1.0 - p.selectivity) * 12.0 + p.selectivity * 1.0;
         let scale = if p.soft_mode { 0.7 } else { 1.0 };
 
-        // Anchor frequencies for the 3 node regions: Low=200 Hz, Mid=2000 Hz, High=12000 Hz.
-        const ANCHOR_FREQS: [f32; 3] = [200.0, 2000.0, 12000.0];
-        // Width in octaves for the triangular weight (±1 octave each side).
-        const ANCHOR_WIDTH_OCT: f32 = 1.0;
-
         // Spectral (cross-band) reference — median over neighboring bands at the same instant.
         let medians = spectral_median(levels_db);
 
         let mut out = [1.0f32; BANDS];
         for i in 0..BANDS {
-            // Compute region_depth: weighted average of node_depths based on
-            // log-frequency proximity to each anchor.
-            let band_log = band_centers[i].max(1.0).log2();
-            let mut weighted_sum = 0.0f32;
-            let mut total_weight = 0.0f32;
-            for j in 0..3 {
-                let anchor_log = ANCHOR_FREQS[j].log2();
-                let dist_octaves = (band_log - anchor_log).abs();
-                // Triangular weight: 1.0 at center, linearly to 0.0 at ±width.
-                let w = (1.0 - dist_octaves / ANCHOR_WIDTH_OCT).max(0.0);
-                weighted_sum += p.node_depths[j] * w;
-                total_weight += w;
-            }
-            let region_depth = if total_weight > 1e-6 {
-                weighted_sum / total_weight
-            } else {
-                1.0 // No anchor influence, use full depth
-            };
+            let region_depth = node_shape(
+                band_centers[i],
+                &p.node_freqs,
+                &p.node_depths,
+                &p.node_shapes,
+                &p.node_enabled,
+            );
 
             // Smooth *toward the spectral median*, not toward this band's own raw level.
             // This prevents a sustained resonance from being "learned" as normal.
@@ -187,7 +293,7 @@ fn coef(ms: f32, frame_time: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::{DetectParams, Detector};
-    use crate::dsp::BANDS;
+    use crate::dsp::{BANDS, MAX_NODES};
 
     /// Generate log-spaced band centers for tests.
     fn test_centers() -> [f32; BANDS] {
@@ -212,7 +318,10 @@ mod tests {
             attack_ms: 10.0,
             release_ms: 100.0,
             soft_mode: false,
-            node_depths: [1.0, 1.0, 1.0],
+            node_depths: [1.0; MAX_NODES],
+            node_freqs: [200.0, 2000.0, 12000.0, 500.0, 1000.0, 4000.0, 8000.0, 16000.0],
+            node_shapes: [0; MAX_NODES],
+            node_enabled: [true, true, true, false, false, false, false, false],
         }
     }
 
@@ -331,5 +440,320 @@ mod tests {
         assert!((med[30] - (-20.0)).abs() < 1e-6);
         // Far from outlier median is also -20
         assert!((med[0] - (-20.0)).abs() < 1e-6);
+    }
+
+    #[test]
+    fn node_shape_returns_depth_at_anchor_freq() {
+        let nf = [200.0, 2000.0, 12000.0, 500.0, 1000.0, 4000.0, 8000.0, 16000.0];
+        let nd = [0.5, 0.8, 0.3, 1.0, 1.0, 1.0, 1.0, 1.0];
+        let ns = [0; MAX_NODES]; // Bell
+        let ne = [true, true, true, false, false, false, false, false];
+        // At an anchor, coverage ≈ 1 so the result is the node average, which
+        // is dominated by (but not exactly equal to) the anchor's depth:
+        // the wider σ = 1.0 kernel lets neighboring nodes leak in a few
+        // percent.  Tolerance loosened from 0.02 to 0.05 for the wider kernel.
+        let shape_at_200 = super::node_shape(200.0, &nf, &nd, &ns, &ne);
+        assert!(
+            (shape_at_200 - 0.5).abs() < 0.05,
+            "at 200 Hz anchor should be ~0.5, got {shape_at_200}"
+        );
+        let shape_at_2k = super::node_shape(2000.0, &nf, &nd, &ns, &ne);
+        assert!(
+            (shape_at_2k - 0.8).abs() < 0.05,
+            "at 2 kHz anchor should be ~0.8, got {shape_at_2k}"
+        );
+        let shape_at_12k = super::node_shape(12000.0, &nf, &nd, &ns, &ne);
+        assert!(
+            (shape_at_12k - 0.3).abs() < 0.05,
+            "at 12 kHz anchor should be ~0.3, got {shape_at_12k}"
+        );
+    }
+
+    #[test]
+    fn node_shape_relaxes_to_neutral_far_from_anchors() {
+        // INTENTIONALLY INVERTED vs the old
+        // `node_shape_far_from_anchors_tracks_weighted_average` test: the old
+        // test asserted the saturating behavior (all-zero depths far from
+        // anchors → ~0.0, i.e. pinned to the nearest node's raw value).  The
+        // neutral-blend fix deliberately changes this: far from every node,
+        // coverage → 0 and the result must trend to neutral 1.0 *regardless*
+        // of what the node depths are.
+        let nf = [500.0, 1000.0, 2000.0, 4000.0, 8000.0, 12000.0, 16000.0, 18000.0];
+        let ns = [0; MAX_NODES]; // Bell
+        let ne = [true, true, true, false, false, false, false, false];
+
+        // All-zero depths, far above every node: must be ~neutral, not ~0.0.
+        let nd_zero = [0.0; MAX_NODES];
+        let shape = super::node_shape(15000.0, &nf, &nd_zero, &ns, &ne);
+        assert!(
+            (shape - 1.0).abs() < 0.05,
+            "all-zero depths far from anchors should relax to ~1.0, got {shape}"
+        );
+
+        // Varied depths, same far point: still ~neutral.
+        let nd_varied = [0.2, 0.0, 0.7, 1.0, 1.0, 1.0, 1.0, 1.0];
+        let shape = super::node_shape(15000.0, &nf, &nd_varied, &ns, &ne);
+        assert!(
+            (shape - 1.0).abs() < 0.05,
+            "varied depths far from anchors should relax to ~1.0, got {shape}"
+        );
+
+        // Far below every node (20 Hz, >4 octaves under the lowest anchor):
+        // total weight is ~numerical zero, same neutral result.
+        let shape = super::node_shape(20.0, &nf, &nd_zero, &ns, &ne);
+        assert!(
+            (shape - 1.0).abs() < 0.01,
+            "far-below-all-nodes should be neutral 1.0, got {shape}"
+        );
+    }
+
+    #[test]
+    fn low_shelf_holds_down_below_anchor() {
+        // Widen spacing so neighbors don't bleed into the shelf region.
+        let nf = [200.0, 5000.0, 18000.0, 500.0, 1000.0, 4000.0, 8000.0, 16000.0];
+        let nd = [0.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]; // Low node at zero depth
+        let ns = [1, 0, 0, 0, 0, 0, 0, 0]; // Low node = Low Shelf
+        let ne = [true, true, true, false, false, false, false, false];
+
+        // Well below the low-shelf anchor: full influence → 0.0.
+        let shape_below = super::node_shape(50.0, &nf, &nd, &ns, &ne);
+        assert!(
+            shape_below < 0.05,
+            "low shelf below anchor should be ~0.0, got {shape_below}"
+        );
+        // At the anchor: ~0.0 (coverage ≈ 1, anchor depth dominates).
+        let shape_at = super::node_shape(200.0, &nf, &nd, &ns, &ne);
+        assert!(
+            shape_at < 0.05,
+            "low shelf at anchor should be ~0.0, got {shape_at}"
+        );
+        // Above the anchor: Gaussian falloff returns toward neutral.
+        let shape_above = super::node_shape(2000.0, &nf, &nd, &ns, &ne);
+        assert!(
+            shape_above > 0.6,
+            "low shelf well above anchor should relax toward 1.0, got {shape_above}"
+        );
+    }
+
+    #[test]
+    fn high_shelf_holds_down_above_anchor() {
+        // Wide spacing; non-shelf nodes zeroed to isolate the high shelf.
+        let nf = [200.0, 2000.0, 12000.0, 500.0, 1000.0, 4000.0, 8000.0, 16000.0];
+        let nd = [1.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0, 1.0];
+        let ns = [0, 0, 2, 0, 0, 0, 0, 0]; // High node = High Shelf
+        let ne = [true, true, true, false, false, false, false, false];
+
+        // Well above the high-shelf anchor: full influence → 0.0.
+        let shape_above = super::node_shape(20000.0, &nf, &nd, &ns, &ne);
+        assert!(
+            shape_above < 0.05,
+            "high shelf above anchor should be ~0.0, got {shape_above}"
+        );
+        // At the anchor: ~0.0.
+        let shape_at = super::node_shape(12000.0, &nf, &nd, &ns, &ne);
+        assert!(
+            shape_at < 0.05,
+            "high shelf at anchor should be ~0.0, got {shape_at}"
+        );
+        // Below the anchor: 200 Hz is >5 octaves away from 12000 Hz,
+        // so the shelf's Gaussian tail is negligible → neutral 1.0.
+        let shape_below = super::node_shape(200.0, &nf, &nd, &ns, &ne);
+        assert!(
+            shape_below > 0.85,
+            "high shelf well below anchor should relax toward 1.0, got {shape_below}"
+        );
+    }
+
+    #[test]
+    fn mixed_shelf_and_bell_coexist() {
+        let nf = [200.0, 2000.0, 10000.0, 500.0, 1000.0, 4000.0, 8000.0, 16000.0];
+        let nd = [0.0, 0.5, 0.0, 1.0, 1.0, 1.0, 1.0, 1.0];
+        let ns = [1, 0, 2, 0, 0, 0, 0, 0]; // Low=Low Shelf, Mid=Bell, High=High Shelf
+        let ne = [true, true, true, false, false, false, false, false];
+
+        // Low shelf below its anchor: attenuated.
+        let shape_low = super::node_shape(50.0, &nf, &nd, &ns, &ne);
+        assert!(shape_low < 0.1, "low shelf region should be attenuated, got {shape_low}");
+        // Mid bell region: partially attenuated (~0.5 at anchor).
+        let shape_mid = super::node_shape(2000.0, &nf, &nd, &ns, &ne);
+        assert!(shape_mid < 0.7, "mid bell region should be attenuated, got {shape_mid}");
+        // High shelf above its anchor: attenuated.
+        let shape_high = super::node_shape(18000.0, &nf, &nd, &ns, &ne);
+        assert!(shape_high < 0.3, "high shelf region should be attenuated, got {shape_high}");
+    }
+
+    #[test]
+    fn overlapping_shelves_average_in_shared_region() {
+        // Low Shelf at 2000 Hz (depth 0.0) + High Shelf at 500 Hz (depth 1.0).
+        // Between 500 and 2000 Hz both shelves hold w = 1.0, so total_weight
+        // ≥ 2.0 → coverage clamped to 1.0 and the result is the true weighted
+        // average of the two depths (not pulled toward neutral 1.0).
+        //
+        // Derived analytically from the node_shape formula (SIGMA = 1.0):
+        let nf = [2000.0, 500.0, 12000.0, 4000.0, 8000.0, 100.0, 300.0, 16000.0];
+        let nd = [0.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0];
+        let ns = [1, 2, 0, 0, 0, 0, 0, 0]; // Low=Shelf, High=Shelf, High2=Bell
+        let ne = [true, true, true, false, false, false, false, false];
+
+        // At 1000 Hz: Low Shelf w=1.0 (below anchor), High Shelf w=1.0 (above anchor).
+        // Bell at 12 kHz has negligible weight (~0.0016).
+        // weighted_sum = 0.0*1.0 + 1.0*1.0 + 1.0*0.0016 = 1.0016
+        // total_weight = 1.0 + 1.0 + 0.0016 = 2.0016
+        // node_avg = 1.0016/2.0016 = 0.5004, coverage = 1.0
+        let shape = super::node_shape(1000.0, &nf, &nd, &ns, &ne);
+        assert!(
+            (shape - 0.500406).abs() < 0.001,
+            "overlap zone at 1000 Hz should average the two shelf depths, got {shape}"
+        );
+        // Must NOT be pulled toward neutral 1.0 — coverage is fully saturated.
+        assert!(
+            shape < 0.6,
+            "overlap must stay near 0.5, not relax toward 1.0, got {shape}"
+        );
+
+        // At 500 Hz (High Shelf anchor): both shelves still w=1.0, Bell ~0.
+        // Result ≈ 0.500007 — pure average of depths [0.0, 1.0].
+        let shape_at_500 = super::node_shape(500.0, &nf, &nd, &ns, &ne);
+        assert!(
+            (shape_at_500 - 0.500007).abs() < 0.001,
+            "at High Shelf anchor should be ~0.5, got {shape_at_500}"
+        );
+
+        // At 2000 Hz (Low Shelf anchor): both shelves still w=1.0, Bell ~0.035.
+        // Result ≈ 0.508708 — slight Bell contamination pushes above 0.5.
+        let shape_at_2k = super::node_shape(2000.0, &nf, &nd, &ns, &ne);
+        assert!(
+            (shape_at_2k - 0.508708).abs() < 0.005,
+            "at Low Shelf anchor should be ~0.509, got {shape_at_2k}"
+        );
+    }
+
+    #[test]
+    fn nested_shelves_boundary_no_nan_or_discontinuity() {
+        // Low Shelf at 1000 Hz (depth 0.0) + High Shelf at 800 Hz (depth 0.7).
+        // The High Shelf holds everything above 800 Hz at w=1.0.
+        // The Low Shelf holds everything below 1000 Hz at w=1.0.
+        // Between 800 and 1000 Hz both are w=1.0 — fully nested overlap.
+        //
+        // Derived analytically from the node_shape formula (SIGMA = 1.0):
+        let nf = [1000.0, 800.0, 12000.0, 4000.0, 200.0, 100.0, 300.0, 16000.0];
+        let nd = [0.0, 0.7, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0];
+        let ns = [1, 2, 0, 0, 0, 0, 0, 0]; // Low=Shelf, High=Shelf, High2=Bell
+        let ne = [true, true, true, false, false, false, false, false];
+
+        // 900 Hz: inside the nested overlap zone. Both shelves w=1.0.
+        // Bell at 12 kHz: negligible (w ≈ 0.00093).
+        // weighted_sum = 0.0*1.0 + 0.7*1.0 = 0.70093
+        // total_weight = 2.00093, node_avg = 0.350291, coverage = 1.0
+        let shape_900 = super::node_shape(900.0, &nf, &nd, &ns, &ne);
+        assert!(
+            (shape_900 - 0.350291).abs() < 0.001,
+            "nested overlap at 900 Hz should be ~0.350, got {shape_900}"
+        );
+        assert!(
+            shape_900 < 0.5,
+            "must not relax toward neutral in overlap zone, got {shape_900}"
+        );
+
+        // 800 Hz: at the High Shelf anchor, inside Low Shelf's held region.
+        // Both shelves w=1.0. Result ≈ 0.350162.
+        let shape_800 = super::node_shape(800.0, &nf, &nd, &ns, &ne);
+        assert!(
+            (shape_800 - 0.350162).abs() < 0.001,
+            "at High Shelf anchor should be ~0.350, got {shape_800}"
+        );
+
+        // 1000 Hz: at the Low Shelf anchor, inside High Shelf's held region.
+        // Both shelves w=1.0. Result ≈ 0.350482.
+        let shape_1000 = super::node_shape(1000.0, &nf, &nd, &ns, &ne);
+        assert!(
+            (shape_1000 - 0.350482).abs() < 0.001,
+            "at Low Shelf anchor should be ~0.350, got {shape_1000}"
+        );
+
+        // Continuity check: no discontinuity at crossover boundaries.
+        // The difference between adjacent samples must be small.
+        let delta_800_900 = (shape_900 - shape_800).abs();
+        let delta_900_1000 = (shape_1000 - shape_900).abs();
+        assert!(
+            delta_800_900 < 0.01,
+            "no discontinuity between 800 and 900 Hz, delta = {delta_800_900}"
+        );
+        assert!(
+            delta_900_1000 < 0.01,
+            "no discontinuity between 900 and 1000 Hz, delta = {delta_900_1000}"
+        );
+
+        // 500 Hz: below both anchors. Low Shelf w=1.0, High Shelf Gaussian
+        // tail w ≈ 0.795, Bell negligible.
+        // Result ≈ 0.309951. Must be sane, no NaN.
+        let shape_500 = super::node_shape(500.0, &nf, &nd, &ns, &ne);
+        assert!(shape_500.is_finite(), "must not be NaN, got {shape_500}");
+        assert!(
+            (shape_500 - 0.309951).abs() < 0.005,
+            "below both anchors should be ~0.310, got {shape_500}"
+        );
+
+        // 1500 Hz: above both anchors. High Shelf w=1.0, Low Shelf Gaussian
+        // tail w ≈ 0.843, Bell ~0.011.
+        // Result ≈ 0.383508. Must be sane, no NaN.
+        let shape_1500 = super::node_shape(1500.0, &nf, &nd, &ns, &ne);
+        assert!(shape_1500.is_finite(), "must not be NaN, got {shape_1500}");
+        assert!(
+            (shape_1500 - 0.383508).abs() < 0.005,
+            "above both anchors should be ~0.384, got {shape_1500}"
+        );
+    }
+
+    #[test]
+    fn disabled_node_contributes_zero_weight() {
+        // A disabled node must be truly absent — not a neutral-depth anchor.
+        // Compare: same slot layout, node 0 enabled vs disabled. With the
+        // node disabled at 2000 Hz (depth 0.0), the curve there must relax
+        // toward neutral instead of dipping to ~0.0.
+        let nf = [200.0, 2000.0, 12000.0, 500.0, 1000.0, 4000.0, 8000.0, 16000.0];
+        let nd = [1.0, 0.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0];
+        let ns = [0; MAX_NODES];
+        let ne_on = [true, true, true, false, false, false, false, false];
+        let ne_off = [true, false, true, false, false, false, false, false];
+
+        let enabled = super::node_shape(2000.0, &nf, &nd, &ns, &ne_on);
+        assert!(
+            enabled < 0.1,
+            "enabled zero-depth node should pull to ~0.0, got {enabled}"
+        );
+        let disabled = super::node_shape(2000.0, &nf, &nd, &ns, &ne_off);
+        assert!(
+            disabled > 0.9,
+            "disabled node must vanish (relax to ~1.0), got {disabled}"
+        );
+    }
+
+    #[test]
+    fn node_shape_interpolates_between_anchors() {
+        // Default-spread anchors with all-zero depths: at the Low anchor the
+        // result is ~0.0 (coverage ≈ 1), mid-gap it sags halfway back toward
+        // neutral (~0.5: partial coverage of an all-zero average), and at the
+        // far left edge (20 Hz, >3 octaves below the lowest node) it has
+        // relaxed back to ~neutral.  No walls, no non-neutral plateaus.
+        let nf = [200.0, 2000.0, 12000.0, 500.0, 1000.0, 4000.0, 8000.0, 16000.0];
+        let nd = [0.0; MAX_NODES];
+        let ns = [0; MAX_NODES]; // Bell
+        let ne = [true, true, true, false, false, false, false, false];
+        let shape_at_200 = super::node_shape(200.0, &nf, &nd, &ns, &ne);
+        let shape_at_mid = super::node_shape(632.0, &nf, &nd, &ns, &ne);
+        let shape_at_edge = super::node_shape(20.0, &nf, &nd, &ns, &ne);
+        assert!(
+            shape_at_200 < 0.05,
+            "at 200 Hz should be near 0.0, got {shape_at_200}"
+        );
+        assert!(
+            shape_at_200 < shape_at_mid && shape_at_mid < 0.7,
+            "mid-gap should rise partway toward neutral, got {shape_at_mid}"
+        );
+        assert!(
+            shape_at_edge > 0.9,
+            "far left edge should relax to ~neutral, got {shape_at_edge}"
+        );
     }
 }
