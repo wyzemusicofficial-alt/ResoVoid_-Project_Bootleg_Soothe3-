@@ -65,6 +65,34 @@ fn flush_denormal(v: f32) -> f32 {
     }
 }
 
+/// Number of samples over which biquad coefficients ramp toward a new target
+/// after `set_gains()`. Linear-interpolates the 5 coefficients per band per
+/// sample (stack-only, no trig, no heap) so analysis-hop updates don't snap.
+pub(crate) const GAIN_RAMP_SAMPLES: usize = 384;
+
+/// Identity coefficients [b0, b1, b2, a1, a2].
+const IDENTITY_COEFFS: [f32; 5] = [1.0, 0.0, 0.0, 0.0, 0.0];
+
+/// Trig-based peaking-EQ coefficient math (same as `Biquad::set_peak`).
+/// Factored out so `set_gains()` can compute *target* coeffs without touching
+/// the live running biquad; the ramp stepper lerps the live coeffs toward
+/// these targets. O(trig) — called once per hop, never per sample.
+#[inline]
+fn peak_coeffs(f0: f32, q: f32, gain_db: f32, fs: f32) -> [f32; 5] {
+    let a = 10.0f32.powf(gain_db / 40.0);
+    let w0 = 2.0 * std::f32::consts::PI * f0 / fs;
+    let cw = w0.cos();
+    let sw = w0.sin();
+    let alpha = sw / (2.0 * q.max(1e-3));
+    let b0 = 1.0 + alpha * a;
+    let b1 = -2.0 * cw;
+    let b2 = 1.0 - alpha * a;
+    let a0 = 1.0 + alpha / a;
+    let a1 = -2.0 * cw;
+    let a2 = 1.0 - alpha / a;
+    [b0 / a0, b1 / a0, b2 / a0, a1 / a0, a2 / a0]
+}
+
 pub struct Biquad {
     b0: f32,
     b1: f32,
@@ -93,24 +121,32 @@ impl Biquad {
     }
 
     /// Configure as a peaking EQ. `gain_db == 0` yields the identity response.
+    /// Trig-based target math (kept unchanged); `BandProcessor::set_gains`
+    /// computes targets via `peak_coeffs()` and ramps the live biquad toward
+    /// them instead of calling this per hop. Kept for tests / external use.
+    #[allow(dead_code)]
     #[inline]
     pub fn set_peak(&mut self, f0: f32, q: f32, gain_db: f32, fs: f32) {
-        let a = 10.0f32.powf(gain_db / 40.0);
-        let w0 = 2.0 * std::f32::consts::PI * f0 / fs;
-        let cw = w0.cos();
-        let sw = w0.sin();
-        let alpha = sw / (2.0 * q.max(1e-3));
-        let b0 = 1.0 + alpha * a;
-        let b1 = -2.0 * cw;
-        let b2 = 1.0 - alpha * a;
-        let a0 = 1.0 + alpha / a;
-        let a1 = -2.0 * cw;
-        let a2 = 1.0 - alpha / a;
-        self.b0 = b0 / a0;
-        self.b1 = b1 / a0;
-        self.b2 = b2 / a0;
-        self.a1 = a1 / a0;
-        self.a2 = a2 / a0;
+        let c = peak_coeffs(f0, q, gain_db, fs);
+        self.b0 = c[0];
+        self.b1 = c[1];
+        self.b2 = c[2];
+        self.a1 = c[3];
+        self.a2 = c[4];
+    }
+
+    #[inline]
+    fn coeffs(&self) -> [f32; 5] {
+        [self.b0, self.b1, self.b2, self.a1, self.a2]
+    }
+
+    #[inline]
+    fn apply_coeffs(&mut self, c: [f32; 5]) {
+        self.b0 = c[0];
+        self.b1 = c[1];
+        self.b2 = c[2];
+        self.a1 = c[3];
+        self.a2 = c[4];
     }
 
     #[inline]
@@ -139,6 +175,13 @@ pub struct BandProcessor {
     prev_input: f32,
     /// Last applied gains, kept so a rate switch can recompute coefficients.
     last_gains: [f32; BANDS],
+    /// Ramp start (prev) coefficients per band: [b0, b1, b2, a1, a2].
+    ramp_from: [[f32; 5]; BANDS],
+    /// Ramp target coefficients per band: [b0, b1, b2, a1, a2].
+    ramp_to: [[f32; 5]; BANDS],
+    /// Samples stepped since the last `set_gains()`. `>= GAIN_RAMP_SAMPLES`
+    /// means the ramp is complete (live == target).
+    ramp_pos: usize,
 }
 
 impl BandProcessor {
@@ -151,6 +194,9 @@ impl BandProcessor {
             oversampled: false,
             prev_input: 0.0,
             last_gains: [1.0; BANDS],
+            ramp_from: [IDENTITY_COEFFS; BANDS],
+            ramp_to: [IDENTITY_COEFFS; BANDS],
+            ramp_pos: GAIN_RAMP_SAMPLES,
         }
     }
 
@@ -176,18 +222,78 @@ impl BandProcessor {
     }
 
     /// Update all band gains from linear gain targets (<= 1.0 => reduction).
+    /// Computes trig-based *target* coefficients and starts a per-sample
+    /// linear ramp from the current live coefficients. Never snaps the live
+    /// biquad. O(BANDS) trig, once per analysis hop — not per sample.
     #[inline]
     pub fn set_gains(&mut self, gains: &[f32; BANDS]) {
         self.last_gains = *gains;
+        // Settle any in-flight ramp into the live biquads so the new ramp
+        // starts from what is actually running (avoids jumps on rapid hops).
+        self.materialize_current();
         let fs = self.synth_rate();
         for i in 0..BANDS {
-            let gain_db = 20.0 * (gains[i].max(1e-4)).log10();
-            self.biquads[i].set_peak(
-                self.layout.centers[i],
-                self.layout.q[i],
-                gain_db,
-                fs,
-            );
+            self.ramp_from[i] = self.biquads[i].coeffs();
+            // Unity (0 dB) is exactly the identity — use canonical identity
+            // coefficients so a unity update is a no-op ramp (no transient
+            // from lerping between two equivalent realizations) and the
+            // state stays clean. Matches `Biquad::identity()`.
+            if gains[i] >= 1.0 - 1e-6 {
+                self.ramp_to[i] = IDENTITY_COEFFS;
+            } else {
+                let gain_db = 20.0 * (gains[i].max(1e-4)).log10();
+                self.ramp_to[i] = peak_coeffs(
+                    self.layout.centers[i],
+                    self.layout.q[i],
+                    gain_db,
+                    fs,
+                );
+            }
+        }
+        self.ramp_pos = 0;
+    }
+
+    /// Write the currently-interpolated coefficients into the live biquads
+    /// without advancing the ramp. Used by `set_gains()` to snapshot state.
+    #[inline]
+    fn materialize_current(&mut self) {
+        if self.ramp_pos >= GAIN_RAMP_SAMPLES {
+            return;
+        }
+        let t = self.ramp_pos as f32 / GAIN_RAMP_SAMPLES as f32;
+        for i in 0..BANDS {
+            let f = self.ramp_from[i];
+            let tt = self.ramp_to[i];
+            self.biquads[i].apply_coeffs([
+                f[0] + (tt[0] - f[0]) * t,
+                f[1] + (tt[1] - f[1]) * t,
+                f[2] + (tt[2] - f[2]) * t,
+                f[3] + (tt[3] - f[3]) * t,
+                f[4] + (tt[4] - f[4]) * t,
+            ]);
+        }
+    }
+
+    /// Advance the coefficient ramp by one (host) sample: O(1) lerps per band
+    /// (5 lerps x BANDS), stack-only, no trig, no heap. When the ramp is
+    /// complete this is a single branch check.
+    #[inline]
+    fn step_ramp(&mut self) {
+        if self.ramp_pos >= GAIN_RAMP_SAMPLES {
+            return;
+        }
+        self.ramp_pos += 1;
+        let t = self.ramp_pos as f32 / GAIN_RAMP_SAMPLES as f32;
+        for i in 0..BANDS {
+            let f = self.ramp_from[i];
+            let tt = self.ramp_to[i];
+            self.biquads[i].apply_coeffs([
+                f[0] + (tt[0] - f[0]) * t,
+                f[1] + (tt[1] - f[1]) * t,
+                f[2] + (tt[2] - f[2]) * t,
+                f[3] + (tt[3] - f[3]) * t,
+                f[4] + (tt[4] - f[4]) * t,
+            ]);
         }
     }
 
@@ -202,16 +308,20 @@ impl BandProcessor {
 
     #[inline]
     pub fn process_sample(&mut self, x: f32) -> f32 {
+        self.step_ramp();
         self.process_cascade(x)
     }
 
     /// 2x internal path: linear-interp upsample (midpoint + current), run the
     /// cascade twice at 2x rate, average for downsampling. Latency-free: the
     /// interpolator/averager add zero host-visible samples of delay.
-    /// `gains` documents the active targets (coefficients already hold them).
+    /// Steps the shared coefficient ramp once per host sample so both
+    /// internal sub-samples use the same interpolated coefficients.
+    /// `gains` documents the active targets (ramp already holds them).
     #[inline]
     pub fn process_sample_2x(&mut self, x: f32, gains: &[f32; BANDS]) -> f32 {
         let _ = gains;
+        self.step_ramp();
         let mid = 0.5 * (self.prev_input + x);
         self.prev_input = x;
         let y0 = self.process_cascade(mid);
@@ -225,6 +335,9 @@ impl BandProcessor {
         }
         self.prev_input = 0.0;
         self.last_gains = [1.0; BANDS];
+        self.ramp_from = [IDENTITY_COEFFS; BANDS];
+        self.ramp_to = [IDENTITY_COEFFS; BANDS];
+        self.ramp_pos = GAIN_RAMP_SAMPLES;
     }
 }
 
