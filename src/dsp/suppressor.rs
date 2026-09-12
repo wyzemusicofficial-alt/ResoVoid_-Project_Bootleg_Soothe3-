@@ -256,15 +256,15 @@ impl ResonanceSuppressor {
         // practice frames arrive in lockstep; the one-sided arms are defensive
         // (a channel with no new frame keeps its previous coefficients).
         match (frame_l, frame_r) {
-            (Some((levels, gains_l)), Some((_, gains_r))) => {
+            (Some((levels, gains_l, conc_l)), Some((_, gains_r, conc_r))) => {
                 let (app_l, app_r) = if linked {
                     let m = linked_gains(&gains_l, &gains_r);
                     (m, m)
                 } else {
                     (gains_l, gains_r)
                 };
-                self.apply_gains(0, idx, &app_l, oversampled);
-                self.apply_gains(1, idx, &app_r, oversampled);
+                self.apply_gains(0, idx, &app_l, &conc_l, oversampled);
+                self.apply_gains(1, idx, &app_r, &conc_r, oversampled);
                 self.applied_gains = [app_l, app_r];
                 let centers = self.channels[0].states[idx].analysis.bands().centers;
                 let _ = self.viz_producer.push(AnalysisFrame {
@@ -274,8 +274,8 @@ impl ResonanceSuppressor {
                     sample_rate: self.sample_rate,
                 });
             }
-            (Some((levels, gains_l)), None) => {
-                self.apply_gains(0, idx, &gains_l, oversampled);
+            (Some((levels, gains_l, conc_l)), None) => {
+                self.apply_gains(0, idx, &gains_l, &conc_l, oversampled);
                 self.applied_gains[0] = gains_l;
                 let centers = self.channels[0].states[idx].analysis.bands().centers;
                 let _ = self.viz_producer.push(AnalysisFrame {
@@ -285,8 +285,8 @@ impl ResonanceSuppressor {
                     sample_rate: self.sample_rate,
                 });
             }
-            (None, Some((levels, gains_r))) => {
-                self.apply_gains(1, idx, &gains_r, oversampled);
+            (None, Some((levels, gains_r, conc_r))) => {
+                self.apply_gains(1, idx, &gains_r, &conc_r, oversampled);
                 self.applied_gains[1] = gains_r;
                 let centers = self.channels[0].states[idx].analysis.bands().centers;
                 let _ = self.viz_producer.push(AnalysisFrame {
@@ -354,13 +354,13 @@ impl ResonanceSuppressor {
         idx: usize,
         x: f32,
         params: DetectParams,
-    ) -> (f32, Option<([f32; BANDS], [f32; BANDS])>) {
+    ) -> (f32, Option<([f32; BANDS], [f32; BANDS], [f32; BANDS])>) {
         let st = &mut ch.states[idx];
         let mut frame = None;
-        if let Some(levels) = st.analysis.process_sample(x) {
+        if let Some(analysis) = st.analysis.process_sample(x) {
             let band_centers = st.analysis.bands().centers;
-            let gains = st.detector.process_frame(&levels, &params, &band_centers);
-            frame = Some((levels, gains));
+            let gains = st.detector.process_frame(&analysis.levels, &params, &band_centers);
+            frame = Some((analysis.levels, gains, analysis.concentration));
         }
         let dry = st.delay.push_pop(x);
         (dry, frame)
@@ -369,10 +369,17 @@ impl ResonanceSuppressor {
     /// Push fresh gains into one channel's biquad cascade, propagating the
     /// oversampling flag first so coefficients compute at the right rate.
     #[inline]
-    fn apply_gains(&mut self, ch: usize, idx: usize, gains: &[f32; BANDS], oversampled: bool) {
+    fn apply_gains(
+        &mut self,
+        ch: usize,
+        idx: usize,
+        gains: &[f32; BANDS],
+        concentration: &[f32; BANDS],
+        oversampled: bool,
+    ) {
         let bands = &mut self.channels[ch].states[idx].bands;
         bands.set_oversampled(oversampled);
-        bands.set_gains(gains);
+        bands.set_gains(gains, concentration);
     }
 }
 
@@ -484,10 +491,10 @@ mod tests {
         // Last sample triggers the FFT.
         let result = eng.process_sample(0.0);
         assert!(result.is_some(), "should return Some after full window");
-        let levels = result.unwrap();
-        assert_eq!(levels.len(), BANDS);
+        let analysis = result.unwrap();
+        assert_eq!(analysis.levels.len(), BANDS);
         // Levels should be finite (not NaN or inf).
-        for &v in &levels {
+        for &v in &analysis.levels {
             assert!(v.is_finite(), "level must be finite, got {v}");
         }
     }
@@ -543,7 +550,8 @@ mod tests {
         for _ in 0..fft - 1 {
             eng.process_sample(1.0);
         }
-        let levels = eng.process_sample(1.0).unwrap();
+        let analysis = eng.process_sample(1.0).unwrap();
+        let levels = analysis.levels;
         // The lowest-frequency band should have significant energy.
         assert!(
             levels[0] > -20.0,

@@ -10,6 +10,22 @@ use realfft::{RealFftPlanner, RealToComplex};
 use crate::dsp::bands::{compute_band_layout, BandLayout};
 use crate::dsp::BANDS;
 
+/// PAR (peak-to-average ratio) in dB that maps to zero concentration
+/// (broadband energy spread evenly across the band's bins).
+const PAR_LOW_DB: f32 = 2.0;
+/// PAR in dB that maps to full concentration (a single dominant bin).
+const PAR_HIGH_DB: f32 = 12.0;
+
+/// Per-frame spectral description: band levels plus a tonal-concentration
+/// estimate per band. Concentration is derived from the in-band
+/// peak-to-average magnitude ratio and is used only to narrow filter Q;
+/// it never feeds detection/threshold logic.
+#[derive(Clone, Copy)]
+pub struct BandAnalysis {
+    pub levels: [f32; BANDS],
+    pub concentration: [f32; BANDS],
+}
+
 /// A single snapshot pushed from the audio thread to the GUI thread.
 #[derive(Clone, Copy)]
 pub struct AnalysisFrame {
@@ -84,7 +100,7 @@ impl AnalysisEngine {
     /// samples, once the ring buffer holds its first full window.
     /// Allocation-free: only preallocated buffers are touched.
     #[inline]
-    pub fn process_sample(&mut self, x: f32) -> Option<[f32; BANDS]> {
+    pub fn process_sample(&mut self, x: f32) -> Option<BandAnalysis> {
         self.buf[self.write_pos] = x;
         self.write_pos += 1;
         if self.write_pos >= self.fft_size {
@@ -113,19 +129,31 @@ impl AnalysisEngine {
             .process_with_scratch(&mut self.input, &mut self.spectrum, &mut self.scratch);
 
         let mut levels = [0.0f32; BANDS];
+        let mut concentration = [0.0f32; BANDS];
         for b in 0..BANDS {
             let lo = self.bands.bin_lo[b];
             let hi = self.bands.bin_hi[b].min(self.spectrum.len() - 1);
             let mut sum = 0.0f32;
+            let mut peak = 0.0f32;
             for k in lo..=hi {
                 let c = self.spectrum[k];
-                sum += (c.re * c.re + c.im * c.im).sqrt();
+                let mag = (c.re * c.re + c.im * c.im).sqrt();
+                sum += mag;
+                if mag > peak {
+                    peak = mag;
+                }
             }
             let n = (hi - lo + 1).max(1) as f32;
-            let mag = sum / n;
-            levels[b] = 20.0 * (mag + 1e-9).log10();
+            let mean_mag = sum / n;
+            levels[b] = 20.0 * (mean_mag + 1e-9).log10();
+            let par_db = 20.0 * ((peak + 1e-9) / (mean_mag + 1e-9)).log10();
+            concentration[b] =
+                ((par_db - PAR_LOW_DB) / (PAR_HIGH_DB - PAR_LOW_DB)).clamp(0.0, 1.0);
         }
-        Some(levels)
+        Some(BandAnalysis {
+            levels,
+            concentration,
+        })
     }
 
     pub fn reset(&mut self) {
@@ -144,5 +172,62 @@ fn make_hann(n: usize) -> Vec<f32> {
         v[i] = 0.5 * (1.0 - (2.0 * std::f32::consts::PI * i as f32 / (n as f32 - 1.0)).cos());
     }
     v
+}
+
+#[cfg(test)]
+mod tests {
+    use super::AnalysisEngine;
+    use crate::dsp::BANDS;
+
+    #[test]
+    fn sine_tone_is_highly_concentrated() {
+        let sr = 44100.0;
+        let fft = 2048;
+        let mut eng = AnalysisEngine::new(fft, sr);
+        let centers = eng.bands().centers;
+        // Pick a mid-high band with enough bins for a clear peak-to-average.
+        let target = 40;
+        let freq = centers[target];
+        let mut out = None;
+        for n in 0..(fft * 2) {
+            let x = (2.0 * std::f32::consts::PI * freq * n as f32 / sr).sin();
+            if let Some(a) = eng.process_sample(x) {
+                out = Some(a);
+            }
+        }
+        let analysis = out.expect("sine must emit a frame");
+        assert!(
+            analysis.concentration[target] > 0.7,
+            "sine at {} Hz should be concentrated, got {}",
+            freq,
+            analysis.concentration[target]
+        );
+    }
+
+    #[test]
+    fn white_noise_is_unconcentrated() {
+        let sr = 44100.0;
+        let fft = 2048;
+        let mut eng = AnalysisEngine::new(fft, sr);
+        // Deterministic LCG white noise (no dev-dependency on rand).
+        let mut state: u32 = 0x12345678;
+        let mut next = || {
+            state = state.wrapping_mul(1664525).wrapping_add(1013904223);
+            ((state >> 8) as f32 / 8_388_608.0) * 2.0 - 1.0
+        };
+        let mut out = None;
+        for _ in 0..(fft * 4) {
+            if let Some(a) = eng.process_sample(next()) {
+                out = Some(a);
+            }
+        }
+        let analysis = out.expect("noise must emit a frame");
+        let mean: f32 =
+            analysis.concentration.iter().sum::<f32>() / BANDS as f32;
+        assert!(
+            mean < 0.3,
+            "white noise mean concentration should be low, got {mean}"
+        );
+    }
 }
 

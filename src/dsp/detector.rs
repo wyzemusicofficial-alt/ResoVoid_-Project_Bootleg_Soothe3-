@@ -13,6 +13,11 @@ use crate::dsp::{BANDS, MAX_NODES};
 /// Half-window radius for the spectral median (total window = 2*R+1 = 13 bands).
 const MEDIAN_HALF_WINDOW: usize = 6;
 
+/// Knee width for hard mode: near-hard-knee (steep, narrow transition).
+const HARD_KNEE_DB: f32 = 0.5;
+/// Knee width for soft mode: wide, gentle transition into full suppression.
+const SOFT_KNEE_DB: f32 = 9.0;
+
 #[derive(Clone, Copy)]
 pub struct DetectParams {
     pub depth: f32,
@@ -159,6 +164,26 @@ pub fn node_shape(
     }
 }
 
+/// Knee-shaped reduction curve (C1-continuous soft/hard knee).
+///
+/// `excess` is `levels_db[i] - reference` (dB above threshold),
+/// `k` is the slope term `effective_depth * (0.5 + sharpness)`,
+/// `knee_db` is the knee width (use [`HARD_KNEE_DB`] or [`SOFT_KNEE_DB`]).
+///
+/// Below `-knee_db/2` the reduction is 0; above `+knee_db/2` it is `k*excess`;
+/// inside the knee it follows the standard quadratic blend so both the value
+/// and the first derivative are continuous at the boundaries.
+fn knee_reduction_db(excess: f32, k: f32, knee_db: f32) -> f32 {
+    let half_knee = knee_db / 2.0;
+    if excess <= -half_knee {
+        0.0
+    } else if excess >= half_knee {
+        (k * excess).max(0.0)
+    } else {
+        k * (excess + half_knee).powi(2) / (2.0 * knee_db)
+    }
+}
+
 pub struct Detector {
     sample_rate: f32,
     /// Samples between consecutive frames (the analysis hop, not the FFT
@@ -203,7 +228,7 @@ impl Detector {
 
         // Threshold (dB): higher selectivity -> smaller threshold -> more is caught.
         let thr = (1.0 - p.selectivity) * 12.0 + p.selectivity * 1.0;
-        let scale = if p.soft_mode { 0.7 } else { 1.0 };
+        let knee_db = if p.soft_mode { SOFT_KNEE_DB } else { HARD_KNEE_DB };
 
         // Spectral (cross-band) reference — median over neighboring bands at the same instant.
         let medians = spectral_median(levels_db);
@@ -232,10 +257,8 @@ impl Detector {
             let excess = levels_db[i] - reference;
             // Apply region_depth multiplier to the global depth before computing reduction.
             let effective_depth = p.depth * region_depth;
-            let mut reduction_db = 0.0f32;
-            if excess > 0.0 {
-                reduction_db = (excess * effective_depth * scale * (0.5 + p.sharpness)).min(36.0);
-            }
+            let k = effective_depth * (0.5 + p.sharpness);
+            let reduction_db = knee_reduction_db(excess, k, knee_db).min(36.0);
             let target_gain = 10.0f32.powf(-reduction_db / 20.0);
             let gcoef = if target_gain < self.gain[i] {
                 gain_attack
@@ -754,6 +777,65 @@ mod tests {
         assert!(
             shape_at_edge > 0.9,
             "far left edge should relax to ~neutral, got {shape_at_edge}"
+        );
+    }
+
+    #[test]
+    fn knee_reduction_is_c1_continuous() {
+        use super::{knee_reduction_db, HARD_KNEE_DB, SOFT_KNEE_DB};
+        // h=1e-4 keeps the O(h * k/knee) finite-difference bias below 1e-3 even
+        // for the narrow hard knee (second derivative k/knee = 3 there).
+        let h = 0.0001f32;
+        for &(k, knee_db) in &[(1.5f32, SOFT_KNEE_DB), (1.5f32, HARD_KNEE_DB)] {
+            let half = knee_db / 2.0;
+            // Value at -half_knee is ~0.0.
+            let at_lo = knee_reduction_db(-half, k, knee_db);
+            assert!(
+                at_lo.abs() < 1e-6,
+                "k={k} knee={knee_db}: at -half expected ~0.0, got {at_lo}"
+            );
+            // Value at +half_knee equals k*half_knee within 1e-4.
+            let at_hi = knee_reduction_db(half, k, knee_db);
+            assert!(
+                (at_hi - k * half).abs() < 1e-4,
+                "k={k} knee={knee_db}: at +half expected {}, got {at_hi}",
+                k * half
+            );
+            // Numerical derivative approaching -half from both sides matches.
+            let d_lo_left =
+                (knee_reduction_db(-half, k, knee_db) - knee_reduction_db(-half - h, k, knee_db)) / h;
+            let d_lo_right =
+                (knee_reduction_db(-half + h, k, knee_db) - knee_reduction_db(-half, k, knee_db)) / h;
+            assert!(
+                (d_lo_left - d_lo_right).abs() < 1e-3,
+                "k={k} knee={knee_db}: derivative mismatch at -half: {d_lo_left} vs {d_lo_right}"
+            );
+            // Numerical derivative approaching +half from both sides matches.
+            let d_hi_left =
+                (knee_reduction_db(half, k, knee_db) - knee_reduction_db(half - h, k, knee_db)) / h;
+            let d_hi_right =
+                (knee_reduction_db(half + h, k, knee_db) - knee_reduction_db(half, k, knee_db)) / h;
+            assert!(
+                (d_hi_left - d_hi_right).abs() < 1e-3,
+                "k={k} knee={knee_db}: derivative mismatch at +half: {d_hi_left} vs {d_hi_right}"
+            );
+        }
+    }
+
+    #[test]
+    fn knee_far_field_converges_between_modes() {
+        use super::{knee_reduction_db, HARD_KNEE_DB, SOFT_KNEE_DB};
+        let k = 1.5f32;
+        let excess = 30.0f32;
+        let hard = knee_reduction_db(excess, k, HARD_KNEE_DB);
+        let soft = knee_reduction_db(excess, k, SOFT_KNEE_DB);
+        assert!(
+            (hard - soft).abs() < 1e-6,
+            "far-field must converge: hard={hard} soft={soft}"
+        );
+        assert!(
+            (hard - k * excess).abs() < 1e-4,
+            "far-field equals k*excess: got {hard}"
         );
     }
 }

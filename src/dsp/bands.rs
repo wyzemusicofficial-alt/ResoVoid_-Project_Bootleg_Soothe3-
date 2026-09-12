@@ -3,6 +3,15 @@
 
 use crate::dsp::BANDS;
 
+/// Maximum allowed -60 dB ringing time for a surgical cut, in milliseconds.
+/// Caps the effective Q at low frequencies where the nominal Q would ring
+/// far longer than this.
+const MAX_RING_MS: f32 = 100.0;
+/// Time in decay-time-constants to reach -60 dB (ln(1000)).
+const RING_TIME_LN_FACTOR: f32 = 6.907755;
+/// Absolute ceiling for the ringing-limited Q, even at high frequencies.
+const NOMINAL_Q_CEILING: f32 = 90.0;
+
 /// Per-band geometry derived for a given FFT size and sample rate.
 #[derive(Clone, Copy)]
 pub struct BandLayout {
@@ -10,6 +19,7 @@ pub struct BandLayout {
     pub bin_lo: [usize; BANDS],
     pub bin_hi: [usize; BANDS],
     pub q: [f32; BANDS],
+    pub q_ceiling: [f32; BANDS],
 }
 
 /// Build a log-spaced set of `BANDS` bands between ~20 Hz and ~96% of Nyquist.
@@ -36,6 +46,7 @@ pub fn compute_band_layout(fft_size: usize, sample_rate: f32) -> BandLayout {
     let mut bin_lo = [0usize; BANDS];
     let mut bin_hi = [0usize; BANDS];
     let mut q = [1.0f32; BANDS];
+    let mut q_ceiling = [1.0f32; BANDS];
 
     for i in 0..BANDS {
         let lo_freq = if i == 0 {
@@ -58,6 +69,9 @@ pub fn compute_band_layout(fft_size: usize, sample_rate: f32) -> BandLayout {
         let oct = (hi_freq / lo_freq).ln() / std::f32::consts::LN_2;
         let two_b = 2.0_f32.powf(oct);
         q[i] = (two_b.sqrt() / (two_b - 1.0)).clamp(0.3, 18.0);
+        let ring_ceiling =
+            (MAX_RING_MS / 1000.0) * std::f32::consts::PI * centers[i] / RING_TIME_LN_FACTOR;
+        q_ceiling[i] = ring_ceiling.min(NOMINAL_Q_CEILING).max(q[i]);
     }
 
     BandLayout {
@@ -65,6 +79,7 @@ pub fn compute_band_layout(fft_size: usize, sample_rate: f32) -> BandLayout {
         bin_lo,
         bin_hi,
         q,
+        q_ceiling,
     }
 }
 
@@ -109,5 +124,22 @@ mod tests {
         let high = compute_band_layout(2048, 96000.0);
         // At higher sample rates the top band reaches higher frequencies.
         assert!(high.centers[BANDS - 1] > low.centers[BANDS - 1]);
+    }
+
+    #[test]
+    fn q_ceiling_covers_nominal_q_and_rises_with_frequency() {
+        let layout = compute_band_layout(2048, 44100.0);
+        for i in 0..BANDS {
+            assert!(
+                layout.q_ceiling[i] >= layout.q[i],
+                "ceiling must cover nominal q at band {i}"
+            );
+        }
+        assert!(
+            layout.q_ceiling[0] < layout.q_ceiling[BANDS - 1],
+            "lowest band ceiling ({}) must be meaningfully smaller than highest ({})",
+            layout.q_ceiling[0],
+            layout.q_ceiling[BANDS - 1]
+        );
     }
 }

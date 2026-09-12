@@ -1093,9 +1093,9 @@ dependencies = [
 
 [[package]]
 name = "nice-plug"
-version = "0.3.0"
+version = "0.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7591aebd56600bede2cf1e4559d16c29309429bb9999511539c39fc830b7e2fe"
+checksum = "b2c9a182dda8672cf907e264d0538b0f57df44e5576d1d9d3f95597654f758ff"
 dependencies = [
  "anyhow",
  "anymap3",
@@ -1118,6 +1118,7 @@ dependencies = [
  "thiserror 2.0.20",
  "tracing",
  "tracing-subscriber",
+ "try-lock",
  "vst3",
  "widestring",
  "windows",
@@ -1125,9 +1126,9 @@ dependencies = [
 
 [[package]]
 name = "nice-plug-core"
-version = "0.3.0"
+version = "0.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3efe28c7689d970d8ebe9afec813895ace1fdb544fb50f79122ccc1ee6dca54b"
+checksum = "b6c4abb7dace40e8da754d9bdc92084c5b1af4d36408c83a3d18e18549320111"
 dependencies = [
  "atomic_float",
  "atomic_refcell",
@@ -1141,6 +1142,7 @@ dependencies = [
  "raw-window-handle",
  "serde",
  "serde_json",
+ "thiserror 2.0.20",
  "tracing",
 ]
 
@@ -1157,9 +1159,9 @@ dependencies = [
 
 [[package]]
 name = "nice-plug-egui"
-version = "0.4.0"
+version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "be992a08bb4413b683bc48752adf92b8540541e885fd4e6401957d9b768e6f4f"
+checksum = "0db7ca9bdce2cc9bbf4ddb3d1135c7dcebec332063bc414e803008ab9e01b62d"
 dependencies = [
  "crossbeam",
  "egui",
@@ -2259,6 +2261,12 @@ dependencies = [
  "num-integer",
  "strength_reduce",
 ]
+
+[[package]]
+name = "try-lock"
+version = "0.2.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e421abadd41a4225275504ea4d6566923418b7f05506fbc9c0fe86ba7396114b"
 
 [[package]]
 name = "unicode-general-category"

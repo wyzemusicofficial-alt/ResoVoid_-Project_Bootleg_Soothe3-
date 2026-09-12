@@ -11,8 +11,8 @@ description = "ResoVoid - Dynamic Resonance Suppressor inspired by Oeksound Soot
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-nice-plug = "0.3"
-nice-plug-egui = "0.4"
+nice-plug = "0.4.1"
+nice-plug-egui = "0.5"
 egui = { version = "0.36", features = ["default_fonts"] }
 realfft = "3"
 atomic_float = "1.1"

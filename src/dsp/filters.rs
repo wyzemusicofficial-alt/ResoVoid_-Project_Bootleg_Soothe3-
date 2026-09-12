@@ -70,6 +70,11 @@ fn flush_denormal(v: f32) -> f32 {
 /// sample (stack-only, no trig, no heap) so analysis-hop updates don't snap.
 pub(crate) const GAIN_RAMP_SAMPLES: usize = 384;
 
+/// Maximum Q multiplier applied to a fully concentrated resonance.
+/// Effective Q = nominal Q * (1 + conc * (Q_BOOST_MAX - 1)), clamped to the
+/// per-band ringing ceiling.
+const Q_BOOST_MAX: f32 = 6.0;
+
 /// Identity coefficients [b0, b1, b2, a1, a2].
 const IDENTITY_COEFFS: [f32; 5] = [1.0, 0.0, 0.0, 0.0, 0.0];
 
@@ -175,6 +180,8 @@ pub struct BandProcessor {
     prev_input: f32,
     /// Last applied gains, kept so a rate switch can recompute coefficients.
     last_gains: [f32; BANDS],
+    /// Last concentration values, kept alongside gains for rate-switch recompute.
+    last_concentration: [f32; BANDS],
     /// Ramp start (prev) coefficients per band: [b0, b1, b2, a1, a2].
     ramp_from: [[f32; 5]; BANDS],
     /// Ramp target coefficients per band: [b0, b1, b2, a1, a2].
@@ -194,6 +201,7 @@ impl BandProcessor {
             oversampled: false,
             prev_input: 0.0,
             last_gains: [1.0; BANDS],
+            last_concentration: [0.0; BANDS],
             ramp_from: [IDENTITY_COEFFS; BANDS],
             ramp_to: [IDENTITY_COEFFS; BANDS],
             ramp_pos: GAIN_RAMP_SAMPLES,
@@ -217,7 +225,8 @@ impl BandProcessor {
         if on != self.oversampled {
             self.oversampled = on;
             let gains = self.last_gains;
-            self.set_gains(&gains);
+            let conc = self.last_concentration;
+            self.set_gains(&gains, &conc);
         }
     }
 
@@ -226,8 +235,9 @@ impl BandProcessor {
     /// linear ramp from the current live coefficients. Never snaps the live
     /// biquad. O(BANDS) trig, once per analysis hop — not per sample.
     #[inline]
-    pub fn set_gains(&mut self, gains: &[f32; BANDS]) {
+    pub fn set_gains(&mut self, gains: &[f32; BANDS], concentration: &[f32; BANDS]) {
         self.last_gains = *gains;
+        self.last_concentration = *concentration;
         // Settle any in-flight ramp into the live biquads so the new ramp
         // starts from what is actually running (avoids jumps on rapid hops).
         self.materialize_current();
@@ -242,9 +252,12 @@ impl BandProcessor {
                 self.ramp_to[i] = IDENTITY_COEFFS;
             } else {
                 let gain_db = 20.0 * (gains[i].max(1e-4)).log10();
+                let q_mult = 1.0 + concentration[i] * (Q_BOOST_MAX - 1.0);
+                let effective_q =
+                    (self.layout.q[i] * q_mult).clamp(0.3, self.layout.q_ceiling[i]);
                 self.ramp_to[i] = peak_coeffs(
                     self.layout.centers[i],
-                    self.layout.q[i],
+                    effective_q,
                     gain_db,
                     fs,
                 );
@@ -335,6 +348,7 @@ impl BandProcessor {
         }
         self.prev_input = 0.0;
         self.last_gains = [1.0; BANDS];
+        self.last_concentration = [0.0; BANDS];
         self.ramp_from = [IDENTITY_COEFFS; BANDS];
         self.ramp_to = [IDENTITY_COEFFS; BANDS];
         self.ramp_pos = GAIN_RAMP_SAMPLES;
@@ -355,7 +369,7 @@ mod tests {
         let mut bp = BandProcessor::new(layout, 44100.0);
 
         let unity = [1.0f32; BANDS];
-        bp.set_gains(&unity);
+        bp.set_gains(&unity, &[0.0f32; BANDS]);
 
         // Run a constant DC signal to let all 64 biquads settle, then verify
         // that the output matches the input in steady state.
@@ -394,7 +408,7 @@ mod tests {
         let layout = compute_band_layout(2048, 44100.0);
         let mut bp = BandProcessor::new(layout, 44100.0);
         bp.set_oversampled(true);
-        bp.set_gains(&[1.0f32; BANDS]);
+        bp.set_gains(&[1.0f32; BANDS], &[0.0f32; BANDS]);
         let unity = [1.0f32; BANDS];
         let mut sum_xx = 0.0f64;
         let mut sum_yy = 0.0f64;
@@ -423,7 +437,7 @@ mod tests {
         let mut bp = BandProcessor::new(layout, 44100.0);
         let mut cut = [1.0f32; BANDS];
         cut[10] = 0.1;
-        bp.set_gains(&cut);
+        bp.set_gains(&cut, &[0.0f32; BANDS]);
         bp.set_oversampled(true);
         bp.set_oversampled(false);
         let y = bp.process_sample(0.5);
@@ -440,5 +454,117 @@ mod tests {
             y = b.process(1.0);
         }
         assert!((y - 1.0).abs() < 1e-5, "0 dB peak should be identity, got {y}");
+    }
+
+    #[test]
+    fn concentration_narrows_q_target() {
+        // NOTE: with the real 20 Hz..20 kHz layout, LF bands (e.g. index 10
+        // at ~60 Hz) have q_ceiling == q by design (ringing limit below the
+        // nominal Q), so a boost there is intentionally inert. To isolate the
+        // concentration->Q path at index 10, use a synthetic layout with
+        // headroom at that index.
+        let mut layout = compute_band_layout(2048, 44100.0);
+        layout.q[10] = 2.0;
+        layout.q_ceiling[10] = 12.0;
+        let mut lo = BandProcessor::new(layout, 44100.0);
+        let mut hi = BandProcessor::new(layout, 44100.0);
+        let mut gains = [1.0f32; BANDS];
+        gains[10] = 0.1;
+        let conc_lo = [0.0f32; BANDS];
+        let mut conc_hi = [0.0f32; BANDS];
+        conc_hi[10] = 1.0;
+        lo.set_gains(&gains, &conc_lo);
+        hi.set_gains(&gains, &conc_hi);
+        assert!(
+            lo.ramp_to[10] != hi.ramp_to[10],
+            "concentrated cut must narrow Q (different target coeffs)"
+        );
+        // And on the real layout a mid band with ceiling headroom also narrows.
+        let real = compute_band_layout(2048, 44100.0);
+        assert!(
+            real.q_ceiling[40] > real.q[40],
+            "mid band should have boost headroom"
+        );
+        let mut lo2 = BandProcessor::new(real, 44100.0);
+        let mut hi2 = BandProcessor::new(real, 44100.0);
+        let mut gains2 = [1.0f32; BANDS];
+        gains2[40] = 0.1;
+        let mut conc2 = [0.0f32; BANDS];
+        conc2[40] = 1.0;
+        lo2.set_gains(&gains2, &[0.0f32; BANDS]);
+        hi2.set_gains(&gains2, &conc2);
+        assert!(
+            lo2.ramp_to[40] != hi2.ramp_to[40],
+            "real-layout mid-band concentrated cut must narrow Q"
+        );
+    }
+
+    #[test]
+    fn high_band_boost_hits_nominal_ceiling() {
+        let layout = compute_band_layout(2048, 44100.0);
+        let last = BANDS - 1;
+        assert!(
+            layout.q_ceiling[last] > 85.0,
+            "top band ceiling should be near 90, got {}",
+            layout.q_ceiling[last]
+        );
+        let mut bp = BandProcessor::new(layout, 44100.0);
+        let mut gains = [1.0f32; BANDS];
+        gains[last] = 0.01;
+        let mut conc = [0.0f32; BANDS];
+        conc[last] = 1.0;
+        bp.set_gains(&gains, &conc);
+        let effective_q =
+            (layout.q[last] * Q_BOOST_MAX).clamp(0.3, layout.q_ceiling[last]);
+        assert!(
+            (effective_q - 90.0).abs() < 6.0,
+            "high-band effective Q should reach near 90, got {effective_q}"
+        );
+        // The stored target must match peak coeffs at the boosted Q.
+        let gain_db = 20.0 * gains[last].max(1e-4).log10();
+        let expected = peak_coeffs(layout.centers[last], effective_q, gain_db, 44100.0);
+        for k in 0..5 {
+            assert!(
+                (bp.ramp_to[last][k] - expected[k]).abs() < 1e-6,
+                "ramp target must use boosted Q (coeff {k} mismatch)"
+            );
+        }
+    }
+
+    #[test]
+    fn lf_cut_ringing_decays_within_limit() {
+        let sr = 44100.0;
+        let layout = compute_band_layout(2048, sr);
+        // Band nearest 200 Hz.
+        let mut target = 0;
+        let mut best = f32::MAX;
+        for i in 0..BANDS {
+            let d = (layout.centers[i] - 200.0).abs();
+            if d < best {
+                best = d;
+                target = i;
+            }
+        }
+        let mut bp = BandProcessor::new(layout, sr);
+        let mut gains = [1.0f32; BANDS];
+        gains[target] = 0.01;
+        let mut conc = [0.0f32; BANDS];
+        conc[target] = 1.0;
+        bp.set_gains(&gains, &conc);
+        // Settle the 384-sample coefficient ramp with silence.
+        for _ in 0..GAIN_RAMP_SAMPLES {
+            bp.process_sample(0.0);
+        }
+        // Unit impulse then ~0.15 s of silence.
+        bp.process_sample(1.0);
+        let tail_len = (0.15 * sr) as usize;
+        let mut tail = 0.0f32;
+        for _ in 0..tail_len {
+            tail = bp.process_sample(0.0);
+        }
+        assert!(
+            tail.abs() < 1e-3,
+            "LF ringing tail must decay below 1e-3 after 0.15 s, got {tail}"
+        );
     }
 }

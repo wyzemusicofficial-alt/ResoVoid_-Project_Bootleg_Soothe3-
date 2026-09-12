@@ -15,7 +15,7 @@ use std::sync::atomic::Ordering;
 use atomic_float::AtomicF32;
 
 use nice_plug::context::gui::{GuiContext, ParamSetter};
-use nice_plug::prelude::{BoolParam, EnumParam, FloatParam};
+use nice_plug::prelude::{BoolParam, EnumParam, FloatParam, Param};
 use nice_plug_egui::baseview::HandlerError;
 use nice_plug_egui::widgets;
 use nice_plug_egui::{Frame, NiceEguiApp};
@@ -460,20 +460,61 @@ fn section_header(ui: &mut egui::Ui, title: &str, theme: &Theme) {
     });
 }
 
+/// Parse a knob type-entry string into a clamped parameter value.
+/// Returns `None` for garbage (non-numeric) input so the caller can reject it
+/// without touching the parameter. Pure helper — unit-tested below.
+fn parse_knob_entry(text: &str, min: f32, max: f32) -> Option<f32> {
+    text.trim()
+        .parse::<f32>()
+        .ok()
+        .filter(|v| v.is_finite())
+        .map(|v| v.clamp(min, max))
+}
+
 /// Draw a native egui rotary knob.
+///
+/// Interactions (GUI thread only):
+/// - drag vertically → continuous change (returned, as before),
+/// - right-click → reset to `default` (returned the same way),
+/// - double-click → inline text entry (Enter commits a parsed f32 clamped to
+///   `[min, max]`, Escape or click-elsewhere cancels).
 fn draw_knob(
     ui: &mut egui::Ui,
     label: &str,
     value: f32,
     min: f32,
     max: f32,
+    default: f32,
     theme: &Theme,
 ) -> Option<f32> {
     let size = egui::vec2(70.0, 110.0);
-    let (rect, response) = ui.allocate_exact_size(size, egui::Sense::drag());
+    let (rect, response) =
+        ui.allocate_exact_size(size, egui::Sense::click_and_drag());
     let painter = ui.painter_at(rect);
     let center = rect.center();
     let radius = (rect.width().min(rect.height()) / 2.0) - 8.0;
+
+    // Per-knob edit state (7 knobs share this widget): a bool flag plus the
+    // text buffer, keyed by label-derived persistent ids in egui temp memory.
+    let edit_flag_id = ui.make_persistent_id(format!("{label}::knob_edit"));
+    let edit_text_id = ui.make_persistent_id(format!("{label}::knob_text"));
+
+    // Right-click resets to the param default and exits any edit session.
+    if response.secondary_clicked() {
+        ui.ctx().memory_mut(|m| {
+            m.data.insert_temp(edit_flag_id, false);
+        });
+        return Some(default.clamp(min, max));
+    }
+
+    // Double-click opens the inline editor, pre-filled with the current value.
+    if response.double_clicked() {
+        ui.ctx().memory_mut(|m| {
+            m.data.insert_temp(edit_flag_id, true);
+            m.data
+                .insert_temp(edit_text_id, format!("{value:.2}"));
+        });
+    }
 
     let t = ((value - min) / (max - min)).clamp(0.0, 1.0);
     let a_min = std::f32::consts::PI * 0.75;
@@ -504,10 +545,59 @@ fn draw_knob(
     let tip = center + radius * egui::Vec2::new(angle.cos(), angle.sin());
     painter.line_segment([center, tip], egui::Stroke::new(2.5, theme.cyan));
 
-    let mut new_value = value;
-    if response.dragged() {
-        let delta = (-response.drag_delta().y / 200.0) * (max - min);
-        new_value = (value + delta).clamp(min, max);
+    // Inline text entry while this knob is in edit mode. Dragging is ignored
+    // for the edited knob so the two interactions can't fight.
+    let editing: bool = ui
+        .ctx()
+        .memory(|m| m.data.get_temp(edit_flag_id).unwrap_or(false));
+    if editing {
+        let mut text: String = ui.ctx().memory(|m| {
+            m.data
+                .get_temp(edit_text_id)
+                .unwrap_or_else(|| format!("{value:.2}"))
+        });
+        let edit_rect = egui::Rect::from_center_size(center, egui::vec2(64.0, 20.0));
+        let edit_resp = ui.put(
+            edit_rect,
+            egui::TextEdit::singleline(&mut text).desired_width(60.0),
+        );
+        if response.double_clicked() {
+            edit_resp.request_focus();
+        }
+        ui.ctx()
+            .memory_mut(|m| m.data.insert_temp(edit_text_id, text.clone()));
+
+        let enter = ui.input(|i| i.key_pressed(egui::Key::Enter));
+        let esc = ui.input(|i| i.key_pressed(egui::Key::Escape));
+        if esc {
+            ui.ctx().memory_mut(|m| {
+                m.data.insert_temp(edit_flag_id, false);
+            });
+        } else if enter {
+            // Garbage input parses to `None` and is rejected: stay in edit
+            // mode, leave the parameter untouched, never panic.
+            if let Some(v) = parse_knob_entry(&text, min, max) {
+                ui.ctx().memory_mut(|m| {
+                    m.data.insert_temp(edit_flag_id, false);
+                });
+                return Some(v);
+            }
+        } else if edit_resp.lost_focus() {
+            // Clicked elsewhere: cancel without changing the parameter.
+            ui.ctx().memory_mut(|m| {
+                m.data.insert_temp(edit_flag_id, false);
+            });
+        }
+        // Fall through to paint the label/value; no drag handling this frame.
+    } else {
+        let mut new_value = value;
+        if response.dragged() {
+            let delta = (-response.drag_delta().y / 200.0) * (max - min);
+            new_value = (value + delta).clamp(min, max);
+        }
+        if response.dragged() {
+            return Some(new_value);
+        }
     }
 
     painter.text(
@@ -525,11 +615,7 @@ fn draw_knob(
         theme.text_dim,
     );
 
-    if response.dragged() {
-        Some(new_value)
-    } else {
-        None
-    }
+    None
 }
 
 /// Draw an arc segment from `start` to `end` (radians) around `center`.
@@ -818,6 +904,9 @@ fn apply_preset(
 }
 
 /// Map a parameter to a knob and apply changes through the `ParamSetter`.
+/// The reset default is pulled from the `FloatParam` itself via
+/// `Param::default_plain_value()` (nice-plug API), never hardcoded, so all
+/// seven Parameters-card knobs reset to their documented lib.rs defaults.
 fn param_knob(
     ui: &mut egui::Ui,
     label: &str,
@@ -828,7 +917,8 @@ fn param_knob(
     theme: &Theme,
 ) {
     let value = param.value();
-    if let Some(new_value) = draw_knob(ui, label, value, min, max, theme) {
+    let default = param.default_plain_value();
+    if let Some(new_value) = draw_knob(ui, label, value, min, max, default, theme) {
         setter.begin_set_parameter(param);
         setter.set_parameter(param, new_value);
         setter.end_set_parameter(param);
@@ -1605,8 +1695,10 @@ fn render_visualizer(
 
 #[cfg(test)]
 mod tests {
-    use super::{gr_tint, nearest_band, Theme};
+    use super::{gr_tint, nearest_band, parse_knob_entry, Theme};
     use crate::dsp::BANDS;
+    use crate::ResoVoidParams;
+    use nice_plug::prelude::Param;
 
     fn log_centers() -> [f32; BANDS] {
         let mut c = [0.0f32; BANDS];
@@ -1668,5 +1760,40 @@ mod tests {
         assert_eq!(light.violet, dark.violet);
         assert_ne!(light.card, dark.card);
         assert_ne!(light.bg_page, dark.bg_page);
+    }
+
+    #[test]
+    fn knob_reset_defaults_match_documented_values() {
+        // Right-click reset pulls these via `Param::default_plain_value()`;
+        // guard against copy-pasted wrong constants per knob.
+        let p = ResoVoidParams::default();
+        assert_eq!(p.depth.default_plain_value(), 0.5);
+        assert_eq!(p.sharpness.default_plain_value(), 0.5);
+        assert_eq!(p.selectivity.default_plain_value(), 0.5);
+        assert_eq!(p.attack.default_plain_value(), 10.0);
+        assert_eq!(p.release.default_plain_value(), 100.0);
+        assert_eq!(p.mix.default_plain_value(), 1.0);
+        assert_eq!(p.output_gain.default_plain_value(), 0.0);
+    }
+
+    #[test]
+    fn knob_text_entry_parses_and_clamps() {
+        assert_eq!(parse_knob_entry("0.75", 0.0, 1.0), Some(0.75));
+        assert_eq!(parse_knob_entry(" 10.0 ", 0.1, 50.0), Some(10.0));
+        // Out-of-range input clamps instead of escaping [min, max].
+        assert_eq!(parse_knob_entry("99.0", 0.0, 1.0), Some(1.0));
+        assert_eq!(parse_knob_entry("-5.0", 0.0, 1.0), Some(0.0));
+    }
+
+    #[test]
+    fn knob_text_entry_rejects_garbage_without_panic() {
+        assert_eq!(parse_knob_entry("", 0.0, 1.0), None);
+        assert_eq!(parse_knob_entry("abc", 0.0, 1.0), None);
+        assert_eq!(parse_knob_entry("1.0.0", 0.0, 1.0), None);
+        assert_eq!(parse_knob_entry("NaN-ish!", -12.0, 12.0), None);
+        // Infinities / NaN parse as f32 but must not corrupt the param:
+        // they never compare usefully, so treat them as rejected.
+        assert_eq!(parse_knob_entry("inf", 0.0, 1.0), None);
+        assert_eq!(parse_knob_entry("NaN", 0.0, 1.0), None);
     }
 }
