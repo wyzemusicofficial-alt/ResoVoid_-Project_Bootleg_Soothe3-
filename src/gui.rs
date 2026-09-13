@@ -953,10 +953,9 @@ fn apply_preset(
 type DebugLogEntry = (u32, [f32; BANDS], [f32; BANDS], [f32; BANDS], [f32; BANDS]);
 
 /// Destination for the temporary concentration CSV (GUI thread only).
+/// Lives in ResoVoid's own presets folder, per spec.
 fn debug_csv_path() -> std::path::PathBuf {
-    let mut p = std::env::temp_dir();
-    p.push("resovoid_concentration.csv");
-    p
+    crate::presets::presets_dir().join("resovoid_concentration.csv")
 }
 
 /// Render the debug log as CSV text. Pure helper (no I/O) — unit-tested below.
@@ -974,11 +973,14 @@ fn format_debug_csv(log: &[DebugLogEntry]) -> String {
 }
 
 /// Write the debug log to `path`. GUI thread only — mirrors how presets.rs
-/// does `std::fs::File::create` + write on the GUI thread.
+/// does directory creation + `std::fs` write on the GUI thread.
 fn write_debug_csv(
     path: &std::path::Path,
     log: &[DebugLogEntry],
 ) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
     std::fs::write(path, format_debug_csv(log))
 }
 
