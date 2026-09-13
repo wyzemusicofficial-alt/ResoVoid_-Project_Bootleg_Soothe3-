@@ -127,6 +127,12 @@ pub struct ResoVoidEditor {
     pub save_name: String,
     pub show_overwrite_confirm: bool,
     pub presets_refresh_at: f64,
+    // TEMPORARY DEBUG FIELDS - remove after concentration diagnosis is done
+    /// Captured viz frames: (hop_index, centers, levels, concentration, gain_linear).
+    /// GUI thread only; capped at 5000 entries (stop appending when full).
+    pub debug_log: Vec<(u32, [f32; BANDS], [f32; BANDS], [f32; BANDS], [f32; BANDS])>,
+    /// Monotonic hop counter stamped onto each `debug_log` entry.
+    pub debug_hop: u32,
 }
 
 impl NiceEguiApp for ResoVoidEditor {
@@ -152,6 +158,19 @@ impl NiceEguiApp for ResoVoidEditor {
             self.latest_reduction = frame.reduction;
             self.centers = frame.centers;
             self.sample_rate.store(frame.sample_rate, Ordering::Relaxed);
+            // TEMPORARY DEBUG CAPTURE - remove after concentration diagnosis is done.
+            // Data-capture side channel only: no DSP behavior changes.
+            // Capped at 5000 entries (stop appending when full). GUI thread only.
+            if self.debug_log.len() < 5000 {
+                self.debug_log.push((
+                    self.debug_hop,
+                    frame.centers,
+                    frame.spectrum,
+                    frame.concentration,
+                    frame.reduction,
+                ));
+            }
+            self.debug_hop = self.debug_hop.wrapping_add(1);
         }
         // Unconditional repaint for smooth spectrogram rendering.
         // The audio thread pushes frames asynchronously — gating repaint
@@ -336,6 +355,28 @@ impl NiceEguiApp for ResoVoidEditor {
                             setter.begin_set_parameter(&self.params.stereo_link);
                             setter.set_parameter(&self.params.stereo_link, link);
                             setter.end_set_parameter(&self.params.stereo_link);
+                        }
+                    });
+
+                    // TEMPORARY DEBUG UI - remove after concentration diagnosis is done.
+                    // CSV write happens here on the GUI thread only (same threading
+                    // model as presets.rs); never any file I/O on the audio thread.
+                    ui.add_space(6.0);
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "Conc. debug (TEMP): {} / 5000 hops",
+                                self.debug_log.len()
+                            ))
+                            .color(theme.text_dim),
+                        );
+                        if ui.button("Dump debug CSV").clicked() {
+                            let path = debug_csv_path();
+                            let _ = write_debug_csv(&path, &self.debug_log);
+                        }
+                        if ui.button("Clear debug log").clicked() {
+                            self.debug_log.clear();
+                            self.debug_hop = 0;
                         }
                     });
                 });
@@ -901,6 +942,44 @@ fn apply_preset(
         setter.set_parameter(&params.stereo_link, s);
         setter.end_set_parameter(&params.stereo_link);
     }
+}
+
+// TEMPORARY DEBUG CSV DUMP - remove after concentration diagnosis is done.
+// Piggybacks on the existing AnalysisFrame rtrb pipeline: frames are captured
+// into `debug_log` on the GUI thread during the normal viz drain, and the CSV
+// write below also runs only on the GUI thread (same threading model as
+// presets.rs — `std::fs` here, never on the audio thread).
+// One row per (hop, band): hop,band,center_hz,level_db,concentration,gain_linear.
+type DebugLogEntry = (u32, [f32; BANDS], [f32; BANDS], [f32; BANDS], [f32; BANDS]);
+
+/// Destination for the temporary concentration CSV (GUI thread only).
+fn debug_csv_path() -> std::path::PathBuf {
+    let mut p = std::env::temp_dir();
+    p.push("resovoid_concentration.csv");
+    p
+}
+
+/// Render the debug log as CSV text. Pure helper (no I/O) — unit-tested below.
+fn format_debug_csv(log: &[DebugLogEntry]) -> String {
+    let mut out = String::from("hop,band,center_hz,level_db,concentration,gain_linear\n");
+    for (hop, centers, levels, concentration, gains) in log {
+        for b in 0..BANDS {
+            out.push_str(&format!(
+                "{hop},{b},{:.3},{:.3},{:.6},{:.6}\n",
+                centers[b], levels[b], concentration[b], gains[b]
+            ));
+        }
+    }
+    out
+}
+
+/// Write the debug log to `path`. GUI thread only — mirrors how presets.rs
+/// does `std::fs::File::create` + write on the GUI thread.
+fn write_debug_csv(
+    path: &std::path::Path,
+    log: &[DebugLogEntry],
+) -> std::io::Result<()> {
+    std::fs::write(path, format_debug_csv(log))
 }
 
 /// Map a parameter to a knob and apply changes through the `ParamSetter`.
@@ -1695,7 +1774,7 @@ fn render_visualizer(
 
 #[cfg(test)]
 mod tests {
-    use super::{gr_tint, nearest_band, parse_knob_entry, Theme};
+    use super::{format_debug_csv, gr_tint, nearest_band, parse_knob_entry, Theme};
     use crate::dsp::BANDS;
     use crate::ResoVoidParams;
     use nice_plug::prelude::Param;
@@ -1795,5 +1874,18 @@ mod tests {
         // they never compare usefully, so treat them as rejected.
         assert_eq!(parse_knob_entry("inf", 0.0, 1.0), None);
         assert_eq!(parse_knob_entry("NaN", 0.0, 1.0), None);
+    }
+
+    #[test]
+    fn debug_csv_formats_one_row_per_hop_band() {
+        // TEMPORARY DEBUG TEST - remove with the concentration debug log.
+        let log = vec![(7u32, [100.0; BANDS], [-20.0; BANDS], [0.5; BANDS], [0.8; BANDS])];
+        let csv = format_debug_csv(&log);
+        let mut lines = csv.lines();
+        assert_eq!(lines.next().unwrap(), "hop,band,center_hz,level_db,concentration,gain_linear");
+        let first = lines.next().unwrap();
+        assert!(first.starts_with("7,0,100.000,-20.000,0.500000,0.800000"), "got {first}");
+        assert_eq!(csv.lines().count(), 1 + BANDS);
+        assert_eq!(format_debug_csv(&[]).lines().count(), 1);
     }
 }

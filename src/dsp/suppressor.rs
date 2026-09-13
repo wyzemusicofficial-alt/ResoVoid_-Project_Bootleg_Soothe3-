@@ -271,6 +271,7 @@ impl ResonanceSuppressor {
                     spectrum: levels,
                     reduction: app_l,
                     centers,
+                    concentration: conc_l,
                     sample_rate: self.sample_rate,
                 });
             }
@@ -282,6 +283,7 @@ impl ResonanceSuppressor {
                     spectrum: levels,
                     reduction: gains_l,
                     centers,
+                    concentration: conc_l,
                     sample_rate: self.sample_rate,
                 });
             }
@@ -293,6 +295,7 @@ impl ResonanceSuppressor {
                     spectrum: levels,
                     reduction: self.applied_gains[0],
                     centers,
+                    concentration: conc_r,
                     sample_rate: self.sample_rate,
                 });
             }

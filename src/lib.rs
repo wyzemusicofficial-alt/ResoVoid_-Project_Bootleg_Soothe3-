@@ -525,6 +525,9 @@ impl Default for ResoVoid {
             show_overwrite_confirm: false,
             presets_refresh_at: f64::NEG_INFINITY,
             dark_mode: false,
+            // TEMPORARY DEBUG FIELDS - remove after concentration diagnosis is done
+            debug_log: Vec::new(),
+            debug_hop: 0,
         };
 
         Self {

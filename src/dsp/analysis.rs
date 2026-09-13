@@ -35,6 +35,8 @@ pub struct AnalysisFrame {
     pub reduction: [f32; BANDS],
     /// Band center frequencies in Hz (cached from the band layout).
     pub centers: [f32; BANDS],
+    // TEMPORARY DEBUG FIELD - remove after concentration diagnosis is done
+    pub concentration: [f32; BANDS],
     /// Current sample rate.
     pub sample_rate: f32,
 }
