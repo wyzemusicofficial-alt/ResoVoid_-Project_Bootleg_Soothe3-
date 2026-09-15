@@ -1,6 +1,6 @@
 # ResoVoid
 
-Dynamic Resonance Suppressor - A Soothe2-inspired spectral processing plugin built with Rust and NIH-plug.
+Dynamic Resonance Suppressor - A Soothe2-inspired spectral processing plugin built with Rust and nice-plug.
 
 ## Features
 
