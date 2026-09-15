@@ -1,4 +1,4 @@
-﻿// src/dsp/analysis.rs
+// src/dsp/analysis.rs
 // STFT analysis front-end: windowed real FFT -> per-band level (dB).
 // Allocation-free at runtime: all buffers are preallocated in `new`.
 
@@ -14,7 +14,19 @@ use crate::dsp::BANDS;
 /// (broadband energy spread evenly across the band's bins).
 const PAR_LOW_DB: f32 = 2.0;
 /// PAR in dB that maps to full concentration (a single dominant bin).
-const PAR_HIGH_DB: f32 = 12.0;
+///
+/// Calibration (no math-reference change - threshold fix): measured in-band
+/// PAR at band 40 (fft 2048 @ 44.1 kHz) is ~11.7 dB for a pure sine,
+/// ~7.5 dB for a 3-harmonic formant-like cluster with vibrato, ~5.5 dB for
+/// a resonant noise bump, and ~4.4 dB mean for white noise. The old 12 dB
+/// ceiling sat at/above the pure-tone PAR, stranding formant material at
+/// ~0.55 concentration (Q mult ~3.8x of 6x). A 9 dB ceiling keeps the sine
+/// saturated at 1.0 while moving the formant cluster to ~0.79 (Q mult ~5x)
+/// and the resonant bump to ~0.50, without pushing the broadband floor
+/// (mean ~0.34) into the concentrated regime. Concentration never feeds
+/// detection - it only narrows filter Q - so the lifted noise floor is
+/// inert unless a cut is actually applied there (unity gains bypass Q).
+const PAR_HIGH_DB: f32 = 9.0;
 
 /// Per-frame spectral description: band levels plus a tonal-concentration
 /// estimate per band. Concentration is derived from the in-band
@@ -226,10 +238,90 @@ mod tests {
         let analysis = out.expect("noise must emit a frame");
         let mean: f32 =
             analysis.concentration.iter().sum::<f32>() / BANDS as f32;
+        // Bound follows the PAR window: under the 2-9 dB mapping the same
+        // physical noise (mean PAR ~4.4 dB) reads ~0.34, so 0.3 would be a
+        // false failure. Intent is unchanged - broadband stays well below
+        // tonal material (sine reads 1.0, formant cluster ~0.79).
         assert!(
-            mean < 0.3,
+            mean < 0.45,
             "white noise mean concentration should be low, got {mean}"
         );
     }
-}
 
+    #[test]
+    fn formant_cluster_engages_q_boost() {
+        // Vocal-formant proxy: 3-harmonic cluster with slight vibrato inside
+        // one band. Under the old 2-12 dB window this read ~0.55 (Q mult
+        // ~3.8x of 6x) - too weak to matter on real vocal renders. Under the
+        // recalibrated 2-9 dB window it must read well into the upper range
+        // so the Q-boost path actually engages on diffuse/formant material.
+        let sr = 44100.0;
+        let fft = 2048;
+        let mut eng = AnalysisEngine::new(fft, sr);
+        let centers = eng.bands().centers;
+        let target = 40;
+        let f0 = centers[target];
+        let mut out = None;
+        for n in 0..(fft * 4) {
+            let t = n as f32 / sr;
+            let vib = 1.0 + 0.003 * (2.0 * std::f32::consts::PI * 5.0 * t).sin();
+            let x = (2.0 * std::f32::consts::PI * f0 * vib * t).sin()
+                + 0.7 * (2.0 * std::f32::consts::PI * f0 * 1.02 * vib * t).sin()
+                + 0.5 * (2.0 * std::f32::consts::PI * f0 * 0.98 * vib * t).sin();
+            if let Some(a) = eng.process_sample(x * 0.4) {
+                out = Some(a);
+            }
+        }
+        let analysis = out.expect("formant must emit a frame");
+        assert!(
+            analysis.concentration[target] > 0.65,
+            "formant cluster at {} Hz should engage Q-boost, got {}",
+            f0,
+            analysis.concentration[target]
+        );
+    }
+
+    #[test]
+    fn resonant_bump_is_partially_concentrated() {
+        // Second diffuse-material proxy: white noise through a ringing
+        // resonator at the band center. Must read clearly above the
+        // broadband floor (white-noise mean ~0.34) without saturating like
+        // a pure tone - the mid-range the recalibration was designed for.
+        let sr = 44100.0;
+        let fft = 2048;
+        let mut eng = AnalysisEngine::new(fft, sr);
+        let centers = eng.bands().centers;
+        let target = 40;
+        let f0 = centers[target];
+        let mut eng2 = AnalysisEngine::new(fft, sr);
+        let mut state: u32 = 0xdeadbeef;
+        let w0 = 2.0 * std::f32::consts::PI * f0 / sr;
+        let r: f32 = 0.985;
+        let c = w0.cos();
+        let mut y1 = 0.0f32;
+        let mut y2 = 0.0f32;
+        let mut out2 = None;
+        for _ in 0..(fft * 4) {
+            state = state.wrapping_mul(1664525).wrapping_add(1013904223);
+            let w = ((state >> 8) as f32 / 8_388_608.0) * 2.0 - 1.0;
+            let y = w + 2.0 * r * c * y1 - r * r * y2;
+            y2 = y1;
+            y1 = y;
+            if let Some(a) = eng2.process_sample(y * 0.05) {
+                out2 = Some(a);
+            }
+        }
+        let a2 = out2.expect("resonant noise must emit a frame");
+        assert!(
+            a2.concentration[target] > 0.4,
+            "resonant bump at {} Hz should read above broadband floor, got {}",
+            f0,
+            a2.concentration[target]
+        );
+        assert!(
+            a2.concentration[target] < 1.0,
+            "resonant bump must not saturate like a pure tone, got {}",
+            a2.concentration[target]
+        );
+    }
+}

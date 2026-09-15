@@ -225,8 +225,12 @@ impl NiceEguiApp for ResoVoidEditor {
             });
             ui.add_space(8.0);
 
-            // Visualizer (draws its own themed card).
+            // Visualizer (draws its own themed card). Height is flexible so
+            // a taller host window stretches the plot instead of leaving
+            // blank page space below the Parameters card. Reserve ~372px
+            // for the params card + gaps; default 672px window keeps 240.
             if let Some(setter) = self.gui_ctx.as_ref().map(|ctx| ctx.param_setter()) {
+                let viz_h = (ui.available_height() - 372.0).max(240.0);
                 render_visualizer(
                     ui,
                     &self.latest_spectrum,
@@ -237,6 +241,7 @@ impl NiceEguiApp for ResoVoidEditor {
                     &self.params,
                     &setter,
                     &theme,
+                    viz_h,
                 );
             }
 
@@ -1141,11 +1146,12 @@ fn render_visualizer(
     params: &ResoVoidParams,
     setter: &ParamSetter,
     theme: &Theme,
+    height: f32,
 ) {
     // Sense::click so double-clicks on empty plot area can create nodes.
     // (Single clicks do nothing; node dots have their own interact rects.)
     let (rect, plot_response) = ui.allocate_exact_size(
-        egui::vec2(ui.available_width(), 240.0),
+        egui::vec2(ui.available_width(), height),
         egui::Sense::click(),
     );
     let painter = ui.painter_at(rect);
