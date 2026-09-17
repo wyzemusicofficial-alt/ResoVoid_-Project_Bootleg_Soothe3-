@@ -48,10 +48,12 @@ impl NodeShape {
     }
 }
 
-/// Default center frequencies for the 8 preallocated node slots. Slots 0–2
-/// are enabled by default and preserve the original 200/2000/12000 Hz anchors.
+/// Default center frequencies for the 8 preallocated node slots. Soothe2
+/// factory default: slots 0-5 active (LowShelf@80Hz/depth0, 4 Bells at
+/// 300/1000/3500/8500Hz depth1.0, HighShelf@15kHz/depth0); slots 6-7 are
+/// spare disabled nodes at 4000/8000Hz.
 pub const NODE_DEFAULT_FREQS: [f32; 8] = [
-    200.0, 2000.0, 12000.0, 500.0, 1000.0, 4000.0, 8000.0, 16000.0,
+    80.0, 300.0, 1000.0, 3500.0, 8500.0, 15000.0, 4000.0, 8000.0,
 ];
 
 /// Stereo gain-reduction coupling.
@@ -306,7 +308,7 @@ impl Default for ResoVoidParams {
 
             node_depth_0: FloatParam::new(
                 "Node Depth 1",
-                1.0,
+                0.0,
                 FloatRange::Linear { min: 0.0, max: 1.0 },
             )
             .with_smoother(SmoothingStyle::Linear(5.0)),
@@ -341,7 +343,7 @@ impl Default for ResoVoidParams {
 
             node_depth_5: FloatParam::new(
                 "Node Depth 6",
-                1.0,
+                0.0,
                 FloatRange::Linear { min: 0.0, max: 1.0 },
             )
             .with_smoother(SmoothingStyle::Linear(5.0)),
@@ -459,18 +461,18 @@ impl Default for ResoVoidParams {
             node_enabled_0: BoolParam::new("Node Enable 1", true),
             node_enabled_1: BoolParam::new("Node Enable 2", true),
             node_enabled_2: BoolParam::new("Node Enable 3", true),
-            node_enabled_3: BoolParam::new("Node Enable 4", false),
-            node_enabled_4: BoolParam::new("Node Enable 5", false),
-            node_enabled_5: BoolParam::new("Node Enable 6", false),
+            node_enabled_3: BoolParam::new("Node Enable 4", true),
+            node_enabled_4: BoolParam::new("Node Enable 5", true),
+            node_enabled_5: BoolParam::new("Node Enable 6", true),
             node_enabled_6: BoolParam::new("Node Enable 7", false),
             node_enabled_7: BoolParam::new("Node Enable 8", false),
 
-            node_shape_0: EnumParam::new("Node Shape 1", NodeShape::Bell),
+            node_shape_0: EnumParam::new("Node Shape 1", NodeShape::LowShelf),
             node_shape_1: EnumParam::new("Node Shape 2", NodeShape::Bell),
             node_shape_2: EnumParam::new("Node Shape 3", NodeShape::Bell),
             node_shape_3: EnumParam::new("Node Shape 4", NodeShape::Bell),
             node_shape_4: EnumParam::new("Node Shape 5", NodeShape::Bell),
-            node_shape_5: EnumParam::new("Node Shape 6", NodeShape::Bell),
+            node_shape_5: EnumParam::new("Node Shape 6", NodeShape::HighShelf),
             node_shape_6: EnumParam::new("Node Shape 7", NodeShape::Bell),
             node_shape_7: EnumParam::new("Node Shape 8", NodeShape::Bell),
 
@@ -500,6 +502,13 @@ impl Default for ResoVoid {
         let (viz_producer, viz_consumer) = RingBuffer::<AnalysisFrame>::new(16);
         let sample_rate_shared = Arc::new(AtomicF32::new(44100.0));
 
+        // Plot-depth default: 0 dB mapped into the visualizer's dB range
+        // (-36..+36 dB): (0 - (-36)) / (36 - (-36)) = 36/72 = 0.5.
+        // NOTE: node_depth_N FloatParams keep their 1.0 defaults (depth
+        // multipliers, intentionally unchanged), and NEW_DEPTH=0.5 in gui.rs
+        // stays mid-plot for newly added nodes — do not conflate either
+        // with this plot-position seed.
+        const NODE_DEFAULT_DEPTH: f32 = 36.0 / 72.0; // = 0.5, 0 dB line for -36..+36 range: (0-(-36))/(36-(-36))
         let initial_editor = ResoVoidEditor {
             params: params.clone(),
             viz_consumer,
@@ -509,14 +518,14 @@ impl Default for ResoVoid {
             sample_rate: sample_rate_shared.clone(),
             gui_ctx: None,
             node_positions: [
-                (1.0, params.node_freq_0.value()),
-                (1.0, params.node_freq_1.value()),
-                (1.0, params.node_freq_2.value()),
-                (1.0, params.node_freq_3.value()),
-                (1.0, params.node_freq_4.value()),
-                (1.0, params.node_freq_5.value()),
-                (1.0, params.node_freq_6.value()),
-                (1.0, params.node_freq_7.value()),
+                (NODE_DEFAULT_DEPTH, params.node_freq_0.value()),
+                (NODE_DEFAULT_DEPTH, params.node_freq_1.value()),
+                (NODE_DEFAULT_DEPTH, params.node_freq_2.value()),
+                (NODE_DEFAULT_DEPTH, params.node_freq_3.value()),
+                (NODE_DEFAULT_DEPTH, params.node_freq_4.value()),
+                (NODE_DEFAULT_DEPTH, params.node_freq_5.value()),
+                (NODE_DEFAULT_DEPTH, params.node_freq_6.value()),
+                (NODE_DEFAULT_DEPTH, params.node_freq_7.value()),
             ],
             preset_names: Vec::new(),
             selected_preset: String::new(),

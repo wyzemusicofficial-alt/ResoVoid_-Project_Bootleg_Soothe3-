@@ -43,12 +43,12 @@ impl Default for DspParams {
             mix: 1.0,
             soft_mode: false,
             delta_mode: false,
-            node_depths: [1.0; MAX_NODES],
+            node_depths: [0.0, 1.0, 1.0, 1.0, 1.0, 0.0, 1.0, 1.0],
             node_freqs: [
-                200.0, 2000.0, 12000.0, 500.0, 1000.0, 4000.0, 8000.0, 16000.0,
+                80.0, 300.0, 1000.0, 3500.0, 8500.0, 15000.0, 4000.0, 8000.0,
             ],
-            node_shapes: [0; MAX_NODES],
-            node_enabled: [true, true, true, false, false, false, false, false],
+            node_shapes: [1, 0, 0, 0, 0, 2, 0, 0],
+            node_enabled: [true, true, true, true, true, true, false, false],
             stereo_linked: true,
             oversampling: false,
         }
@@ -161,10 +161,23 @@ pub struct ResonanceSuppressor {
     applied_gains: [[f32; BANDS]; 2],
     sample_rate: f32,
     viz_producer: Producer<AnalysisFrame>,
+    /// Monotonic analysis-frame counter stamped onto each `AnalysisFrame`.
+    /// Plain `wrapping_add` on the audio thread: no allocation, no atomics.
+    frame_counter: u32,
     /// Linear crossfade ramp: counts down from CROSSFADE_LEN to 0 after an
     /// FFT-size switch. While nonzero the wet output is attenuated to avoid
     /// clicks caused by the discontinuity in analysis/delay state.
     crossfade_remaining: usize,
+}
+
+/// Detector-side depth diagnostics for one channel frame (all stack arrays).
+/// Carries `effective_depth` / `reduction_db` / `target_gain` from
+/// `Detector::process_frame` to the `AnalysisFrame` builder without heap.
+#[derive(Clone, Copy)]
+struct DepthDebug {
+    effective_depth: [f32; BANDS],
+    reduction_db: [f32; BANDS],
+    target_gain: [f32; BANDS],
 }
 
 impl ResonanceSuppressor {
@@ -183,6 +196,7 @@ impl ResonanceSuppressor {
             applied_gains: [[1.0; BANDS]; 2],
             sample_rate,
             viz_producer,
+            frame_counter: 0,
             crossfade_remaining: 0,
         }
     }
@@ -236,6 +250,7 @@ impl ResonanceSuppressor {
             ch.reset();
         }
         self.applied_gains = [[1.0; BANDS]; 2];
+        self.frame_counter = 0;
         self.crossfade_remaining = 0;
     }
 
@@ -256,7 +271,7 @@ impl ResonanceSuppressor {
         // practice frames arrive in lockstep; the one-sided arms are defensive
         // (a channel with no new frame keeps its previous coefficients).
         match (frame_l, frame_r) {
-            (Some((levels, gains_l, conc_l)), Some((_, gains_r, conc_r))) => {
+            (Some((levels, gains_l, conc_l, dbg_l)), Some((_, gains_r, conc_r, _))) => {
                 let (app_l, app_r) = if linked {
                     let m = linked_gains(&gains_l, &gains_r);
                     (m, m)
@@ -266,38 +281,23 @@ impl ResonanceSuppressor {
                 self.apply_gains(0, idx, &app_l, &conc_l, oversampled);
                 self.apply_gains(1, idx, &app_r, &conc_r, oversampled);
                 self.applied_gains = [app_l, app_r];
-                let centers = self.channels[0].states[idx].analysis.bands().centers;
-                let _ = self.viz_producer.push(AnalysisFrame {
-                    spectrum: levels,
-                    reduction: app_l,
-                    centers,
-                    concentration: conc_l,
-                    sample_rate: self.sample_rate,
-                });
+                // Depth side channel: detector diagnostics from the levels
+                // source (left) + filter diagnostics from ch0 (matches app_l).
+                self.push_depth_frame(idx, 0, levels, app_l, conc_l, dbg_l);
             }
-            (Some((levels, gains_l, conc_l)), None) => {
+            (Some((levels, gains_l, conc_l, dbg_l)), None) => {
                 self.apply_gains(0, idx, &gains_l, &conc_l, oversampled);
                 self.applied_gains[0] = gains_l;
-                let centers = self.channels[0].states[idx].analysis.bands().centers;
-                let _ = self.viz_producer.push(AnalysisFrame {
-                    spectrum: levels,
-                    reduction: gains_l,
-                    centers,
-                    concentration: conc_l,
-                    sample_rate: self.sample_rate,
-                });
+                self.push_depth_frame(idx, 0, levels, gains_l, conc_l, dbg_l);
             }
-            (None, Some((levels, gains_r, conc_r))) => {
+            (None, Some((levels, gains_r, conc_r, dbg_r))) => {
                 self.apply_gains(1, idx, &gains_r, &conc_r, oversampled);
                 self.applied_gains[1] = gains_r;
-                let centers = self.channels[0].states[idx].analysis.bands().centers;
-                let _ = self.viz_producer.push(AnalysisFrame {
-                    spectrum: levels,
-                    reduction: self.applied_gains[0],
-                    centers,
-                    concentration: conc_r,
-                    sample_rate: self.sample_rate,
-                });
+                // Pre-existing quirk preserved: `reduction` reports the stale
+                // left gains while spectrum/concentration come from the right.
+                // Depth diagnostics report the fresh right channel (ch1 filter).
+                let stale_left = self.applied_gains[0];
+                self.push_depth_frame(idx, 1, levels, stale_left, conc_r, dbg_r);
             }
             (None, None) => {
                 // No new detector data: still propagate a toggled oversampling
@@ -351,22 +351,73 @@ impl ResonanceSuppressor {
     /// dry sample plus fresh detector output when a new analysis frame fired.
     /// Gain application is deliberately left to the caller (`process_sample`)
     /// so stereo linking can combine both channels first.
+    /// The fourth tuple element carries detector depth diagnostics
+    /// (stack arrays only — allocation-free).
     #[inline]
     fn process_channel(
         ch: &mut ChannelBundle,
         idx: usize,
         x: f32,
         params: DetectParams,
-    ) -> (f32, Option<([f32; BANDS], [f32; BANDS], [f32; BANDS])>) {
+    ) -> (
+        f32,
+        Option<([f32; BANDS], [f32; BANDS], [f32; BANDS], DepthDebug)>,
+    ) {
         let st = &mut ch.states[idx];
         let mut frame = None;
         if let Some(analysis) = st.analysis.process_sample(x) {
             let band_centers = st.analysis.bands().centers;
             let gains = st.detector.process_frame(&analysis.levels, &params, &band_centers);
-            frame = Some((analysis.levels, gains, analysis.concentration));
+            frame = Some((
+                analysis.levels,
+                gains,
+                analysis.concentration,
+                DepthDebug {
+                    effective_depth: *st.detector.last_effective_depth(),
+                    reduction_db: *st.detector.last_reduction_db(),
+                    target_gain: *st.detector.last_target_gain(),
+                },
+            ));
         }
         let dry = st.delay.push_pop(x);
         (dry, frame)
+    }
+
+    /// Build one depth-diagnostic `AnalysisFrame` and push it on the existing
+    /// viz rtrb side channel. Reads filter diagnostics (`gain_db`,
+    /// `effective_q`) from channel `filter_ch` (already updated by
+    /// `apply_gains`). All audio-thread work is fixed-size array copies plus
+    /// one `wrapping_add`; no String/Vec/file I/O. If the ring is full the
+    /// frame is dropped (same policy as the existing viz push).
+    #[inline]
+    fn push_depth_frame(
+        &mut self,
+        idx: usize,
+        filter_ch: usize,
+        spectrum: [f32; BANDS],
+        smoothed: [f32; BANDS],
+        concentration: [f32; BANDS],
+        dbg: DepthDebug,
+    ) {
+        let st = &self.channels[filter_ch].states[idx];
+        let centers = st.analysis.bands().centers;
+        let gain_db = *st.bands.last_gain_db();
+        let effective_q = *st.bands.last_effective_q();
+        let frame_idx = self.frame_counter;
+        self.frame_counter = self.frame_counter.wrapping_add(1);
+        let _ = self.viz_producer.push(AnalysisFrame {
+            spectrum,
+            reduction: smoothed,
+            centers,
+            concentration,
+            sample_rate: self.sample_rate,
+            frame_idx,
+            effective_depth: dbg.effective_depth,
+            reduction_db: dbg.reduction_db,
+            target_gain: dbg.target_gain,
+            gain_db,
+            effective_q,
+        });
     }
 
     /// Push fresh gains into one channel's biquad cascade, propagating the
@@ -744,5 +795,102 @@ mod tests {
         assert_eq!(sup.latency(), 1024);
         sup.set_fft_size_index(3);
         assert_eq!(sup.latency(), 8192);
+    }
+
+    // ------------------------------------------------- Depth-chain CSV side channel
+    //
+    // Vocal-like render through the full chain (analysis -> detector ->
+    // filters -> viz ring). Drains the EXISTING rtrb side channel and renders
+    // one CSV row per (frame, band) via the test-only `format_depth_csv`.
+    // No String/Vec/file IO runs on the audio thread: `process_sample` only
+    // performs fixed-size float stores + one wrapping counter increment.
+    #[test]
+    fn depth_chain_frames_carry_diagnostics_and_format_as_csv() {
+        use crate::dsp::analysis::{format_depth_csv, DEPTH_CSV_HEADER};
+
+        let sr = 44100.0;
+        let (tx, mut rx) = rtrb::RingBuffer::<AnalysisFrame>::new(64);
+        let mut sup = ResonanceSuppressor::new(sr, tx);
+        sup.set_params(DspParams {
+            depth: 1.0,
+            sharpness: 0.5,
+            selectivity: 1.0, // low threshold so the resonance bites
+            ..DspParams::default()
+        });
+        // Vocal-like stimulus: 220 Hz harmonic stack (f0 + 4 harmonics).
+        let harm = [1.0, 0.6, 0.4, 0.3, 0.2];
+        for n in 0..32768 {
+            let t = n as f32 / sr;
+            let mut x = 0.0;
+            for (h, a) in harm.iter().enumerate() {
+                x += a * (2.0 * std::f32::consts::PI * 220.0 * (h + 1) as f32 * t).sin();
+            }
+            x *= 0.4;
+            // Sustained whistle resonance near 2.2 kHz to force reduction.
+            x += 0.5 * (2.0 * std::f32::consts::PI * 2200.0 * t).sin();
+            let _ = sup.process_sample(x, x);
+            // Drain continuously so the small ring never drops frames.
+            while rx.pop().is_ok() {}
+        }
+        // Final drain: collect the tail frames for CSV rendering.
+        let mut frames = Vec::new();
+        for n in 0..8192 {
+            let t = (32768 + n) as f32 / sr;
+            let mut x = 0.0;
+            for (h, a) in harm.iter().enumerate() {
+                x += a * (2.0 * std::f32::consts::PI * 220.0 * (h + 1) as f32 * t).sin();
+            }
+            x *= 0.4;
+            x += 0.5 * (2.0 * std::f32::consts::PI * 2200.0 * t).sin();
+            let _ = sup.process_sample(x, x);
+            while let Ok(f) = rx.pop() {
+                frames.push(f);
+            }
+        }
+        assert!(!frames.is_empty(), "vocal render must emit viz frames");
+        // Frame indices are monotonic (wrapping).
+        for w in frames.windows(2) {
+            assert_eq!(
+                w[1].frame_idx,
+                w[0].frame_idx.wrapping_add(1),
+                "frame_idx must increment once per pushed frame"
+            );
+        }
+        // Per-stage invariants on every band of every frame.
+        for f in &frames {
+            for b in 0..BANDS {
+                let ed = f.effective_depth[b];
+                let rdb = f.reduction_db[b];
+                let tg = f.target_gain[b];
+                let sm = f.reduction[b];
+                let gdb = f.gain_db[b];
+                let q = f.effective_q[b];
+                assert!(ed.is_finite(), "effective_depth finite");
+                assert!((0.0..=1.0).contains(&ed), "effective_depth in 0..=1, got {ed}");
+                assert!((0.0..=36.0).contains(&rdb), "reduction_db clamped, got {rdb}");
+                assert!((0.0..=1.0).contains(&tg), "target_gain in 0..=1, got {tg}");
+                assert!((0.0..=1.0 + 1e-6).contains(&sm), "smoothed_gain <= 1, got {sm}");
+                // target_gain must equal 10^(-reduction_db/20) by construction.
+                let expect_tg = 10.0f32.powf(-rdb / 20.0);
+                assert!(
+                    (tg - expect_tg).abs() < 1e-4,
+                    "target_gain {tg} vs 10^(-{rdb}/20)={expect_tg}"
+                );
+                // gain_db must equal 20*log10(max(smoothed,1e-4)) within Q-path
+                // tolerance (unity branch pins 0.0 exactly).
+                let expect_gdb = 20.0 * sm.max(1e-4).log10();
+                assert!(
+                    (gdb - expect_gdb).abs() < 1e-3,
+                    "gain_db {gdb} vs 20log10({sm})={expect_gdb}"
+                );
+                assert!(gdb <= 1e-6, "gain_db never positive, got {gdb}");
+                assert!(q.is_finite() && q > 0.0, "effective_q positive, got {q}");
+            }
+        }
+        // CSV shape: header + one row per (frame, band).
+        let csv = format_depth_csv(&frames);
+        let mut lines = csv.lines();
+        assert_eq!(lines.next().unwrap(), DEPTH_CSV_HEADER);
+        assert_eq!(csv.lines().count(), 1 + frames.len() * BANDS);
     }
 }

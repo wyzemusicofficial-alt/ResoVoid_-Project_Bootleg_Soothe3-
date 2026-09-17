@@ -225,12 +225,20 @@ impl NiceEguiApp for ResoVoidEditor {
             });
             ui.add_space(8.0);
 
-            // Visualizer (draws its own themed card). Height is flexible so
-            // a taller host window stretches the plot instead of leaving
-            // blank page space below the Parameters card. Reserve ~372px
-            // for the params card + gaps; default 672px window keeps 240.
+            // Body is top-down: header -> visualizer card (fixed height,
+            // never starves the params card) -> Parameters card at its
+            // natural height. Both cards stay fully visible at the default
+            // 1080x672 window.
             if let Some(setter) = self.gui_ctx.as_ref().map(|ctx| ctx.param_setter()) {
-                let viz_h = (ui.available_height() - 372.0).max(240.0);
+                // Visualizer card (draws its own themed card). Fixed ~240px
+                // with a small stretch allowance on taller windows, clamped
+                // so it never starves the Parameters card below it.
+                // Reuses the outer `setter`; no second gui_ctx lookup.
+                // Reserve for everything below the visualizer: Parameters
+                // card natural height + inter-card gaps.
+                const BELOW_VIZ_RESERVE: f32 = 372.0;
+                let viz_h = ((ui.available_height() - BELOW_VIZ_RESERVE).max(240.0))
+                    .min((ui.available_height() * 0.6).max(240.0));
                 render_visualizer(
                     ui,
                     &self.latest_spectrum,
@@ -243,12 +251,9 @@ impl NiceEguiApp for ResoVoidEditor {
                     &theme,
                     viz_h,
                 );
-            }
+                ui.add_space(12.0);
 
-            ui.add_space(12.0);
-
-            if let Some(setter) = self.gui_ctx.as_ref().map(|ctx| ctx.param_setter()) {
-                // Parameters card
+                // Parameters card (natural height, all rows unchanged)
                 let mut card = egui::Frame::default();
                 card.fill = theme.card;
                 card.stroke = egui::Stroke::new(1.0, theme.border);
@@ -385,6 +390,7 @@ impl NiceEguiApp for ResoVoidEditor {
                         }
                     });
                 });
+            }
 
                 if self.show_save_dialog {
                     egui::Window::new("Save Preset").show(ui.ctx(), |ui| {
@@ -444,7 +450,6 @@ impl NiceEguiApp for ResoVoidEditor {
                         });
                     });
                 }
-            }
         });
 
     }
@@ -1177,14 +1182,18 @@ fn render_visualizer(
         egui::StrokeKind::Outside,
     ));
 
-    let plot = rect.shrink(12.0);
+    let mut plot = rect.shrink(12.0);
+    // Header strip for legend — keeps 0dB-anchored badges clear of text.
+    // All y_of/x_of closures are built after this point so gridlines,
+    // node_y, shape baseline, and drag math all follow consistently.
+    plot.min.y += 24.0;
 
     let f_min = 20.0_f32;
     let f_max = (sample_rate * 0.5).min(20000.0).max(f_min * 2.0);
     let l_min = f_min.log10();
     let l_max = f_max.log10();
-    let db_min = -80.0_f32;
-    let db_max = 12.0_f32;
+    let db_min = -36.0_f32;
+    let db_max = 36.0_f32;
 
     let x_of = |freq: f32| -> f32 {
         let l = freq.max(f_min).log10();
@@ -1223,13 +1232,13 @@ fn render_visualizer(
                 egui::pos2(x, plot.bottom() + 10.0),
                 egui::Align2::CENTER_TOP,
                 label,
-                egui::FontId::proportional(9.0),
-                theme.text_dim,
+                egui::FontId::proportional(10.0),
+                theme.text,
             );
         }
     }
     // dB grid lines.
-    for &db in &[-60.0_f32, -40.0, -20.0, 0.0] {
+    for &db in &[-36.0_f32, -18.0, 0.0, 18.0, 36.0] {
         let y = y_of(db);
         painter.line_segment(
             [egui::pos2(plot.left(), y), egui::pos2(plot.right(), y)],
@@ -1310,7 +1319,6 @@ fn render_visualizer(
             for pt in envelope_pts.iter().rev() {
                 area.push(*pt);
             }
-            area.push(*spec_pts.first().unwrap()); // close back to start
 
             painter.add(egui::Shape::Path(PathShape {
                 points: area,
@@ -1341,7 +1349,7 @@ fn render_visualizer(
         f_min,
         f_max,
         &x_of,
-        &|db| y_of(db.clamp(-40.0, 0.0)),
+        &|db| y_of(db.clamp(db_min, 0.0)),
         INTERP_POINTS,
     );
     if red_pts.len() >= 2 {
@@ -1354,18 +1362,19 @@ fn render_visualizer(
     // --- Node shape curve (Soothe3-style white tilt-curve equivalent) ---
     // Visual mapping: region_depth is a 0..1 multiplier on the global depth.
     // We map it to plot-y so that 1.0 (full depth, no attenuation) sits at
-    // `shape_baseline_y` (near the top, aligned with depth=1.0 node dots),
+    // `shape_baseline_y` (0 dB line via y_of, clamped into the plot),
     // and 0.0 (zero depth) drops to `shape_baseline_y + shape_range`.
     // Departures from 1.0 bow downward, connecting the 3 node dots into one
     // continuous shape — the Soothe3-style tilt curve.
     //
     // Design choice: the curve uses the exact same `node_shape()` function
     // that the DSP detector calls — single source of truth, no visual drift.
+    // Baseline is anchored to 0 dB via y_of so it tracks the rescaled axis
+    // (header inset + -36..+36 dB range) instead of a top-anchored fraction.
     const SHAPE_SAMPLES: usize = 1000;
-    const SHAPE_BASELINE_FRAC: f32 = 0.05; // 5% from top = neutral line (depth=1.0)
     const SHAPE_RANGE_FRAC: f32 = 0.90;    // full drop covers 90% of plot height
 
-    let shape_baseline_y = plot.top() + plot.height() * SHAPE_BASELINE_FRAC;
+    let shape_baseline_y = y_of(0.0);
     let shape_range = plot.height() * SHAPE_RANGE_FRAC;
 
     // Collect the node params once for sampling.
@@ -1420,27 +1429,36 @@ fn render_visualizer(
         let t = s as f32 / (SHAPE_SAMPLES - 1) as f32;
         let freq = 10.0_f32.powf(l_min_s + t * (l_max_s - l_min_s));
         let depth = node_shape(freq, &nf, &nd, &nsh, &nen);
-        let y = shape_baseline_y + (1.0 - depth) * shape_range;
+        let y = (shape_baseline_y + (1.0 - depth) * shape_range)
+            .clamp(plot.top(), plot.bottom());
         shape_pts.push(egui::pos2(x_of(freq), y));
     }
 
     // Draw a subtle fill from the neutral baseline down to the shape curve.
+    // Skipped when flat (max deviation < 0.5px) so a neutral curve cannot
+    // fan a diagonal wedge via triangulation.
     if shape_pts.len() >= 2 {
-        let mut fill_area: Vec<egui::Pos2> = Vec::with_capacity(shape_pts.len() + 2);
-        fill_area.push(egui::pos2(shape_pts.first().unwrap().x, shape_baseline_y));
-        fill_area.extend_from_slice(&shape_pts);
-        fill_area.push(egui::pos2(shape_pts.last().unwrap().x, shape_baseline_y));
-        painter.add(egui::Shape::Path(PathShape {
-            points: fill_area,
-            closed: true,
+        let max_dev = shape_pts
+            .iter()
+            .map(|p| (p.y - shape_baseline_y).abs())
+            .fold(0.0_f32, f32::max);
+        if max_dev >= 0.5 {
+            let mut fill_area: Vec<egui::Pos2> = Vec::with_capacity(shape_pts.len() + 2);
+            fill_area.push(egui::pos2(shape_pts.first().unwrap().x, shape_baseline_y));
+            fill_area.extend_from_slice(&shape_pts);
+            fill_area.push(egui::pos2(shape_pts.last().unwrap().x, shape_baseline_y));
+            painter.add(egui::Shape::Path(PathShape {
+                points: fill_area,
+                closed: true,
                 fill: Color32::from_rgba_unmultiplied(
                     theme.shape.r(),
                     theme.shape.g(),
                     theme.shape.b(),
                     18,
                 ),
-            stroke: egui::Stroke::NONE.into(),
-        }));
+                stroke: egui::Stroke::NONE.into(),
+            }));
+        }
     }
     // Draw the shape line itself.
     if shape_pts.len() >= 2 {
@@ -1758,25 +1776,25 @@ fn render_visualizer(
     // (drag / double-click / menu), never re-spammed every frame.
 
     // Axis tick labels for dB.
-    for &db in &[-60.0_f32, -40.0, -20.0, 0.0] {
+    for &db in &[-36.0_f32, -18.0, 0.0, 18.0, 36.0] {
         painter.text(
             egui::pos2(plot.left() + 4.0, y_of(db)),
             egui::Align2::LEFT_CENTER,
             format!("{db}"),
-            egui::FontId::proportional(9.0),
-            theme.text_dim,
+            egui::FontId::proportional(10.0),
+            theme.text,
         );
     }
 
     painter.text(
-        egui::pos2(plot.left() + 6.0, plot.top() + 4.0),
+        egui::pos2(plot.left() + 6.0, plot.top() - 20.0),
         egui::Align2::LEFT_TOP,
         format!(
             "Spectrum (cyan) / Reduction (violet), 20 Hz - {} kHz, log — drag nodes to move, double-click empty space to add, click badge for shape, right-click for delete",
             (f_max / 1000.0).round() as u32
         ),
-        egui::FontId::proportional(11.0),
-        theme.text_dim,
+        egui::FontId::proportional(12.0),
+        theme.text,
     );
 }
 

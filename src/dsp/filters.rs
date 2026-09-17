@@ -182,6 +182,11 @@ pub struct BandProcessor {
     last_gains: [f32; BANDS],
     /// Last concentration values, kept alongside gains for rate-switch recompute.
     last_concentration: [f32; BANDS],
+    /// Depth-chain diagnostics, refreshed in `set_gains` with plain float
+    /// stores only (allocation-free on the audio thread):
+    /// per-band `gain_db` and `effective_q` actually sent to `peak_coeffs`.
+    last_gain_db: [f32; BANDS],
+    last_effective_q: [f32; BANDS],
     /// Ramp start (prev) coefficients per band: [b0, b1, b2, a1, a2].
     ramp_from: [[f32; 5]; BANDS],
     /// Ramp target coefficients per band: [b0, b1, b2, a1, a2].
@@ -194,6 +199,11 @@ pub struct BandProcessor {
 impl BandProcessor {
     pub fn new(layout: BandLayout, sample_rate: f32) -> Self {
         let biquads = [(); BANDS].map(|_| Biquad::identity());
+        // Snapshot nominal Q so `last_effective_q` is meaningful pre-first-hop.
+        let mut nominal_q = [1.0f32; BANDS];
+        for i in 0..BANDS {
+            nominal_q[i] = layout.q[i];
+        }
         Self {
             biquads,
             layout,
@@ -202,10 +212,24 @@ impl BandProcessor {
             prev_input: 0.0,
             last_gains: [1.0; BANDS],
             last_concentration: [0.0; BANDS],
+            last_gain_db: [0.0; BANDS],
+            last_effective_q: nominal_q,
             ramp_from: [IDENTITY_COEFFS; BANDS],
             ramp_to: [IDENTITY_COEFFS; BANDS],
             ramp_pos: GAIN_RAMP_SAMPLES,
         }
+    }
+
+    /// Last per-band `gain_db` sent toward `peak_coeffs` (0.0 at unity).
+    #[inline]
+    pub fn last_gain_db(&self) -> &[f32; BANDS] {
+        &self.last_gain_db
+    }
+
+    /// Last per-band `effective_q` sent toward `peak_coeffs`.
+    #[inline]
+    pub fn last_effective_q(&self) -> &[f32; BANDS] {
+        &self.last_effective_q
     }
 
     /// Effective synthesis rate: doubled when oversampling is active.
@@ -250,11 +274,16 @@ impl BandProcessor {
             // state stays clean. Matches `Biquad::identity()`.
             if gains[i] >= 1.0 - 1e-6 {
                 self.ramp_to[i] = IDENTITY_COEFFS;
+                // Depth-chain side channel: unity maps to 0 dB + nominal Q.
+                self.last_gain_db[i] = 0.0;
+                self.last_effective_q[i] = self.layout.q[i];
             } else {
                 let gain_db = 20.0 * (gains[i].max(1e-4)).log10();
                 let q_mult = 1.0 + concentration[i] * (Q_BOOST_MAX - 1.0);
                 let effective_q =
                     (self.layout.q[i] * q_mult).clamp(0.3, self.layout.q_ceiling[i]);
+                self.last_gain_db[i] = gain_db;
+                self.last_effective_q[i] = effective_q;
                 self.ramp_to[i] = peak_coeffs(
                     self.layout.centers[i],
                     effective_q,
@@ -349,6 +378,10 @@ impl BandProcessor {
         self.prev_input = 0.0;
         self.last_gains = [1.0; BANDS];
         self.last_concentration = [0.0; BANDS];
+        self.last_gain_db = [0.0; BANDS];
+        for i in 0..BANDS {
+            self.last_effective_q[i] = self.layout.q[i];
+        }
         self.ramp_from = [IDENTITY_COEFFS; BANDS];
         self.ramp_to = [IDENTITY_COEFFS; BANDS];
         self.ramp_pos = GAIN_RAMP_SAMPLES;
@@ -566,5 +599,98 @@ mod tests {
             tail.abs() < 1e-3,
             "LF ringing tail must decay below 1e-3 after 0.15 s, got {tail}"
         );
+    }
+
+    // Diagnostic alarm, NOT a regression gate: it panics deterministically on
+    // the current code (stacking reproduces by construction), so it is
+    // `#[ignore]`d to keep `cargo test` green. Run it explicitly when
+    // diagnosing vocal renders or validating a neighbor-inhibition fix:
+    // `cargo test flanking -- --ignored`.
+    #[test]
+    #[ignore = "diagnostic alarm: fails by design until neighbor inhibition / shared-Q lands; run with --ignored"]
+    fn flanking_cuts_flagged_when_neighbors_cut_together() {
+        // Flanking-notch texture risk: detector.rs scores every band
+        // independently (no neighbor suppression), so a single resonance can
+        // push 2-3 adjacent bands to gains < 1 at once. Each of those then
+        // takes the concentration->Q narrowing path in `set_gains`, cutting
+        // deep AND narrow at nearly the same center, so the cuts stack into
+        // a wide rough-edged flanking notch instead of one surgical cut.
+        // Intended behavior (future work): neighbor inhibition or a shared-Q
+        // allocation so one resonance yields one narrow cut, not flankers.
+        // This test only REPORTS the narrowed-cut composite (no assert on
+        // it) and fails exactly in the extreme stacking regime: >= 2
+        // adjacent bands both deeper than -12 dB while narrowed past 2x
+        // their nominal Q.
+        let layout = compute_band_layout(2048, 44100.0);
+        let nominal_q = layout.q;
+        let centers = layout.centers;
+        // Three adjacent mid bands with room to narrow past 2x nominal Q.
+        let mut mid: Option<usize> = None;
+        for i in 1..BANDS - 1 {
+            if layout.q_ceiling[i - 1] > 2.0 * layout.q[i - 1]
+                && layout.q_ceiling[i] > 2.0 * layout.q[i]
+                && layout.q_ceiling[i + 1] > 2.0 * layout.q[i + 1]
+            {
+                mid = Some(i);
+                break;
+            }
+        }
+        let m = mid.expect("need 3 adjacent bands with Q-boost headroom");
+        let idx = [m - 1, m, m + 1];
+        // Synthetic single resonance seen by all three neighbors at once.
+        let mut bp = BandProcessor::new(layout, 44100.0);
+        let mut gains = [1.0f32; BANDS];
+        let mut conc = [0.0f32; BANDS];
+        for &i in &idx {
+            gains[i] = 0.1; // -20 dB
+            conc[i] = 1.0; // max narrowing
+        }
+        bp.set_gains(&gains, &conc);
+        let gain_db = *bp.last_gain_db();
+        let eff_q = *bp.last_effective_q();
+        // Informational composite only: cutting (< -3 dB) while narrowed
+        // (> 2x nominal Q). Reported, never asserted.
+        let narrowed_cuts = (0..BANDS)
+            .filter(|&i| gain_db[i] < -3.0 && eff_q[i] > 2.0 * nominal_q[i])
+            .count();
+        println!(
+            "flanking composite: {narrowed_cuts} narrowed cuts \
+             (band  center_hz  gain_db  eff_q  nominal_q):"
+        );
+        for &i in &idx {
+            println!(
+                "  [{i}]  {:.1}  {:.2}  {:.2}  {:.2}",
+                centers[i], gain_db[i], eff_q[i], nominal_q[i]
+            );
+        }
+        // Flag: any adjacent pair within the driven cluster both deeper
+        // than -12 dB while narrowed.
+        let stacked = idx.windows(2).any(|w| {
+            gain_db[w[0]] < -12.0
+                && gain_db[w[1]] < -12.0
+                && eff_q[w[0]] > 2.0 * nominal_q[w[0]]
+                && eff_q[w[1]] > 2.0 * nominal_q[w[1]]
+        });
+        if stacked {
+            panic!(
+                "flanking-notch stacking: {} adjacent bands cut deeper than \
+                 -12 dB while narrowed >2x nominal Q. per-band \
+                 (center_hz, gain_db, effective_q): [{:.1} Hz, {:.2} dB, Q {:.2}] \
+                 [{:.1} Hz, {:.2} dB, Q {:.2}] [{:.1} Hz, {:.2} dB, Q {:.2}]. \
+                 one resonance produced {} simultaneous narrow cuts; want \
+                 neighbor inhibition or shared-Q (future work).",
+                idx.len(),
+                centers[idx[0]],
+                gain_db[idx[0]],
+                eff_q[idx[0]],
+                centers[idx[1]],
+                gain_db[idx[1]],
+                eff_q[idx[1]],
+                centers[idx[2]],
+                gain_db[idx[2]],
+                eff_q[idx[2]],
+                narrowed_cuts,
+            );
+        }
     }
 }

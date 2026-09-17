@@ -18,6 +18,39 @@ const HARD_KNEE_DB: f32 = 0.5;
 /// Knee width for soft mode: wide, gentle transition into full suppression.
 const SOFT_KNEE_DB: f32 = 9.0;
 
+/// Reference frequency (Hz) for frequency-scaled ballistics: a band centered
+/// exactly here runs at the user-facing `attack_ms`/`release_ms` unchanged
+/// (scale factor 1.0). Bands below run slower (longer τ), bands above faster.
+///
+/// 1000 Hz is the conventional midrange anchor (also the ISO 226 / Fletcher–
+/// Munson reference): with the log-spaced layout in bands.rs (20 Hz–20 kHz
+/// over 64 bands, so band ~37 sits near 1 kHz) it lands near the geometric
+/// middle of the audible range, keeping the extreme-band multipliers bounded
+/// (≈3x slower at 40 Hz, ≈0.4x faster at 16 kHz with the α below).
+const BALLISTICS_FREQ_REF: f32 = 1000.0;
+
+/// Exponent α for frequency-scaled ballistics: τ(f) = τ_base · (f_ref / f)^α.
+///
+/// Per-octave cost is 2^α ≈ 1.27x (α = 0.35), so each octave down stretches
+/// timing ~27% and each octave up compresses it ~21% — clearly audible in an
+/// A/B without turning sub-bass into molasses or treble into chatter. Over
+/// the full ~10-octave range (20 Hz–20 kHz) the total spread is 2^(10α) ≈ 11x
+/// (40 Hz ≈ 3.0x slower, 16 kHz ≈ 0.38x faster), versus ≈32x at α = 0.5
+/// (too grabby up top, too sluggish down low) and ≈5.7x at α = 0.25 (barely
+/// perceptible). α = 0 is the uniform-timing fallback (scale ≡ 1.0); see the
+/// `ballistics_scaling_is_uniform_at_zero_alpha` regression test.
+const BALLISTICS_ALPHA: f32 = 0.35;
+
+/// Frequency scale multiplier for one band: (f_ref / f)^α.
+///
+/// `alpha` is a parameter (rather than reading [`BALLISTICS_ALPHA`] directly)
+/// so tests can pass 0.0 to verify the uniform-timing fallback. Frequencies
+/// are clamped to ≥ 1 Hz for float safety (never triggered in practice —
+/// band centers start at ~20 Hz).
+fn ballistics_scale(freq_hz: f32, alpha: f32) -> f32 {
+    (BALLISTICS_FREQ_REF / freq_hz.max(1.0)).powf(alpha)
+}
+
 #[derive(Clone, Copy)]
 pub struct DetectParams {
     pub depth: f32,
@@ -46,10 +79,10 @@ impl Default for DetectParams {
             attack_ms: 10.0,
             release_ms: 100.0,
             soft_mode: false,
-            node_depths: [1.0; MAX_NODES],
-            node_freqs: [200.0, 2000.0, 12000.0, 500.0, 1000.0, 4000.0, 8000.0, 16000.0],
-            node_shapes: [0; MAX_NODES],
-            node_enabled: [true, true, true, false, false, false, false, false],
+            node_depths: [0.0, 1.0, 1.0, 1.0, 1.0, 0.0, 1.0, 1.0],
+            node_freqs: [80.0, 300.0, 1000.0, 3500.0, 8500.0, 15000.0, 4000.0, 8000.0],
+            node_shapes: [1, 0, 0, 0, 0, 2, 0, 0],
+            node_enabled: [true, true, true, true, true, true, false, false],
         }
     }
 }
@@ -192,6 +225,12 @@ pub struct Detector {
     /// Smoothed spectral reference (follows the per-frame median, not raw level).
     baseline: [f32; BANDS],
     gain: [f32; BANDS],
+    /// Depth-chain diagnostics, refreshed once per `process_frame`.
+    /// Fixed-size float stores only: allocation-free on the audio thread.
+    /// Read by `ResonanceSuppressor` when building `AnalysisFrame`.
+    last_effective_depth: [f32; BANDS],
+    last_reduction_db: [f32; BANDS],
+    last_target_gain: [f32; BANDS],
 }
 
 impl Detector {
@@ -201,7 +240,28 @@ impl Detector {
             frame_hop: frame_hop as f32,
             baseline: [0.0; BANDS],
             gain: [1.0; BANDS],
+            last_effective_depth: [0.0; BANDS],
+            last_reduction_db: [0.0; BANDS],
+            last_target_gain: [1.0; BANDS],
         }
+    }
+
+    /// Last frame's `effective_depth` per band (p.depth * region_depth).
+    #[inline]
+    pub fn last_effective_depth(&self) -> &[f32; BANDS] {
+        &self.last_effective_depth
+    }
+
+    /// Last frame's clamped `reduction_db` per band.
+    #[inline]
+    pub fn last_reduction_db(&self) -> &[f32; BANDS] {
+        &self.last_reduction_db
+    }
+
+    /// Last frame's pre-follower `target_gain` per band.
+    #[inline]
+    pub fn last_target_gain(&self) -> &[f32; BANDS] {
+        &self.last_target_gain
     }
 
     /// Process one analysis frame, returning smoothed linear gains per band (<= 1.0).
@@ -213,18 +273,36 @@ impl Detector {
     /// zipper noise is audible at small FFT sizes (1024, where windows are
     /// short), consider moving the follower to per-sample operation.
     ///
-    /// The 3 node_depths act as per-region depth attenuators — dragging a node
-    /// down reduces suppression in that frequency neighborhood. The 3 node_freqs
+    /// The node_depths act as per-region depth attenuators — dragging a node
+    /// down reduces suppression in that frequency neighborhood. The node_freqs
     /// set the center frequency of each region. Gaussian weights in octave-distance
     /// space provide smooth, C∞ interpolation between regions.
     #[inline]
     pub fn process_frame(&mut self, levels_db: &[f32; BANDS], p: &DetectParams, band_centers: &[f32; BANDS]) -> [f32; BANDS] {
         let frame_time = self.frame_hop / self.sample_rate;
 
-        let baseline_attack = coef(p.attack_ms, frame_time);
-        let baseline_release = coef(p.release_ms, frame_time);
-        let gain_attack = coef((p.attack_ms * 0.5).max(0.5), frame_time);
-        let gain_release = coef((p.release_ms * 0.5).max(5.0), frame_time);
+        // Frequency-scaled ballistics: τ(f) = τ_base · (f_ref / f)^α, so high
+        // bands react faster and low bands slower. `p.attack_ms`/`p.release_ms`
+        // stay the user-facing base constants; the scale multiplies them before
+        // `coef()` (which is nonlinear in τ, so the coefficient itself cannot
+        // just be scaled). The existing 0.5x gain-follower speedup and its
+        // floors are preserved — the scale applies *after* the floor, so the
+        // full HF speedup survives instead of being clamped back to the
+        // uniform floor (`coef()` retains its own 0.1 ms / frame_time safety).
+        //
+        // Recomputed per frame (64 × powf at the analysis frame rate, ~tens of
+        // Hz — negligible): `band_centers` legitimately changes across calls
+        // (it depends on FFT size / sample rate via `compute_band_layout`, and
+        // `Detector` holds no layout state), so caching the scales inside
+        // `Detector` would need invalidation logic and risks stale timing
+        // after an FFT-size switch. Recompute is the correct trade.
+        let mut freq_scale = [1.0f32; BANDS];
+        for i in 0..BANDS {
+            freq_scale[i] = ballistics_scale(band_centers[i], BALLISTICS_ALPHA);
+        }
+        // Base (pre-scale) follower times in ms, matching the previous uniform math.
+        let base_gain_attack_ms = (p.attack_ms * 0.5).max(0.5);
+        let base_gain_release_ms = (p.release_ms * 0.5).max(5.0);
 
         // Threshold (dB): higher selectivity -> smaller threshold -> more is caught.
         let thr = (1.0 - p.selectivity) * 12.0 + p.selectivity * 1.0;
@@ -246,10 +324,11 @@ impl Detector {
             // Smooth *toward the spectral median*, not toward this band's own raw level.
             // This prevents a sustained resonance from being "learned" as normal.
             let spectral_ref = medians[i];
+            let s = freq_scale[i];
             let bcoef = if spectral_ref > self.baseline[i] {
-                baseline_attack
+                coef(p.attack_ms * s, frame_time)
             } else {
-                baseline_release
+                coef(p.release_ms * s, frame_time)
             };
             self.baseline[i] += (spectral_ref - self.baseline[i]) * bcoef;
 
@@ -260,10 +339,14 @@ impl Detector {
             let k = effective_depth * (0.5 + p.sharpness);
             let reduction_db = knee_reduction_db(excess, k, knee_db).min(36.0);
             let target_gain = 10.0f32.powf(-reduction_db / 20.0);
+            // Depth-chain side channel: plain float stores, no allocation.
+            self.last_effective_depth[i] = effective_depth;
+            self.last_reduction_db[i] = reduction_db;
+            self.last_target_gain[i] = target_gain;
             let gcoef = if target_gain < self.gain[i] {
-                gain_attack
+                coef(base_gain_attack_ms * s, frame_time)
             } else {
-                gain_release
+                coef(base_gain_release_ms * s, frame_time)
             };
             self.gain[i] += (target_gain - self.gain[i]) * gcoef;
             out[i] = self.gain[i];
@@ -274,6 +357,9 @@ impl Detector {
     pub fn reset(&mut self) {
         self.baseline = [0.0; BANDS];
         self.gain = [1.0; BANDS];
+        self.last_effective_depth = [0.0; BANDS];
+        self.last_reduction_db = [0.0; BANDS];
+        self.last_target_gain = [1.0; BANDS];
     }
 }
 
@@ -781,6 +867,121 @@ mod tests {
     }
 
     #[test]
+    fn high_freq_band_converges_faster_than_low() {
+        use super::{BALLISTICS_ALPHA, BALLISTICS_FREQ_REF};
+        // Same sudden resonance, two identical detectors, one peaked low
+        // (index 5, ≈35 Hz) and one peaked high (index 55, ≈8.3 kHz with the
+        // log-spaced test centers). Frequency scaling must make the high band
+        // reach the target in measurably fewer frames.
+        //
+        // Timing regime: hop 256 @ 44.1 kHz → frame_time ≈ 5.8 ms, attack 50 ms
+        // so every band is *unsaturated* (τ_base > frame_time) and the per-band
+        // τ spread actually shows up in `coef()`. (With the default 2048-hop /
+        // 10 ms attack the followers saturate at 0.632 for all bands, which is
+        // why existing tests are unaffected — verified, not assumed.)
+        assert!(
+            BALLISTICS_ALPHA > 0.0,
+            "scaling must be active for this test, got α = {BALLISTICS_ALPHA}"
+        );
+        let centers = test_centers();
+        assert!(
+            centers[5] < BALLISTICS_FREQ_REF && centers[55] > BALLISTICS_FREQ_REF,
+            "test bands must straddle f_ref: got {} Hz and {} Hz",
+            centers[5],
+            centers[55]
+        );
+
+        let mut p = params();
+        p.selectivity = 1.0; // thr = 1 dB so the 40 dB peak is unambiguous
+        p.attack_ms = 50.0;
+        p.release_ms = 200.0;
+
+        let quiet = [-30.0f32; BANDS];
+        let mut resonant_lo = quiet;
+        resonant_lo[5] = 10.0;
+        let mut resonant_hi = quiet;
+        resonant_hi[55] = 10.0;
+
+        // Prime both detectors on quiet so baselines settle at -30 dB.
+        let mut det_lo = Detector::new(256, 44100.0);
+        let mut det_hi = Detector::new(256, 44100.0);
+        for _ in 0..30 {
+            det_lo.process_frame(&quiet, &p, &centers);
+            det_hi.process_frame(&quiet, &p, &centers);
+        }
+
+        // Step the identical resonance and count frames to cross gain < 0.5
+        // (target is ≈0.016 for a 39 dB excess, so 0.5 is solidly mid-flight).
+        let frames_to_half = |det: &mut Detector, levels: &[f32; BANDS], band: usize| -> usize {
+            for n in 1..=60 {
+                let gains = det.process_frame(levels, &p, &centers);
+                if gains[band] < 0.5 {
+                    return n;
+                }
+            }
+            usize::MAX // never converged — test setup broken, fail loudly below
+        };
+        let lo_frames = frames_to_half(&mut det_lo, &resonant_lo, 5);
+        let hi_frames = frames_to_half(&mut det_hi, &resonant_hi, 55);
+
+        assert!(
+            hi_frames <= 60 && lo_frames <= 60,
+            "both bands must converge within 60 frames: hi={hi_frames} lo={lo_frames}"
+        );
+        assert!(
+            hi_frames < lo_frames,
+            "high band ({} Hz) must converge faster than low band ({} Hz): hi={hi_frames} frames lo={lo_frames} frames",
+            centers[55],
+            centers[5]
+        );
+        assert!(
+            hi_frames + 2 <= lo_frames,
+            "speedup must be measurable (≥2 frames), not a 1-frame rounding edge: hi={hi_frames} lo={lo_frames}"
+        );
+    }
+
+    #[test]
+    fn ballistics_scaling_is_uniform_at_zero_alpha() {
+        use super::{ballistics_scale, coef, BALLISTICS_ALPHA, BALLISTICS_FREQ_REF};
+        // α = 0 must reduce exactly to the old uniform-timing behavior:
+        // every band's scale is 1.0, so every band's effective τ equals τ_base.
+        for &f in &[20.0f32, 40.0, 100.0, 1000.0, 8000.0, 16000.0, 20000.0] {
+            let s = ballistics_scale(f, 0.0);
+            assert!(
+                (s - 1.0).abs() < 1e-6,
+                "α=0 must give scale 1.0 at {f} Hz, got {s}"
+            );
+        }
+        // …and that identity flows through the real `coef()` math unchanged.
+        let frame_time = 256.0 / 44100.0;
+        for &ms in &[10.0f32, 25.0, 50.0, 100.0] {
+            let uniform = coef(ms, frame_time);
+            for &f in &[35.0f32, 1000.0, 8300.0] {
+                let scaled = coef(ms * ballistics_scale(f, 0.0), frame_time);
+                assert!(
+                    (scaled - uniform).abs() < 1e-9,
+                    "α=0 coef must equal uniform coef (ms={ms}, f={f}): {scaled} vs {uniform}"
+                );
+            }
+        }
+        // Guard the active default points the right way (would catch a flipped
+        // ratio or a negative α): reference is unity, lows are slowed, highs
+        // are quickened, monotonically.
+        assert!(
+            (ballistics_scale(BALLISTICS_FREQ_REF, BALLISTICS_ALPHA) - 1.0).abs() < 1e-6,
+            "f_ref must map to scale 1.0"
+        );
+        let s_lo = ballistics_scale(40.0, BALLISTICS_ALPHA);
+        let s_hi = ballistics_scale(16000.0, BALLISTICS_ALPHA);
+        assert!(s_lo > 1.0, "40 Hz must be slowed (scale > 1), got {s_lo}");
+        assert!(s_hi < 1.0, "16 kHz must be quickened (scale < 1), got {s_hi}");
+        assert!(
+            s_lo > s_hi,
+            "scale must fall with frequency, got lo={s_lo} hi={s_hi}"
+        );
+    }
+
+    #[test]
     fn knee_reduction_is_c1_continuous() {
         use super::{knee_reduction_db, HARD_KNEE_DB, SOFT_KNEE_DB};
         // h=1e-4 keeps the O(h * k/knee) finite-difference bias below 1e-3 even
@@ -837,5 +1038,170 @@ mod tests {
             (hard - k * excess).abs() < 1e-4,
             "far-field equals k*excess: got {hard}"
         );
+    }
+
+    #[test]
+    fn node_shape_has_no_third_production_caller() {
+        // Production sources that may legally reference `node_shape`.
+        // Paths are anchored at the crate root via CARGO_MANIFEST_DIR so the
+        // test is independent of the including file's location.
+        let files: &[(&str, &str)] = &[
+            (
+                "src/dsp/detector.rs",
+                include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/dsp/detector.rs")),
+            ),
+            (
+                "src/gui.rs",
+                include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/gui.rs")),
+            ),
+            (
+                "src/lib.rs",
+                include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/lib.rs")),
+            ),
+            (
+                "src/dsp/suppressor.rs",
+                include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/dsp/suppressor.rs")),
+            ),
+            (
+                "src/dsp/filters.rs",
+                include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/dsp/filters.rs")),
+            ),
+            (
+                "src/dsp/analysis.rs",
+                include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/dsp/analysis.rs")),
+            ),
+            (
+                "src/dsp/bands.rs",
+                include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/dsp/bands.rs")),
+            ),
+            (
+                "src/dsp/mod.rs",
+                include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/dsp/mod.rs")),
+            ),
+        ];
+
+        /// Production code only: everything before the unit-test module.
+        /// Cuts at the newline-anchored `mod tests {` (not `#[cfg(test)]`),
+        /// because gui.rs carries an early `#[cfg(test)]` test-only helper
+        /// (`Theme::luminance`) far above its real test module — cutting at
+        /// the first `#[cfg(test)]` would wrongly discard the GUI production
+        /// caller. The leading `\n` keeps this from self-matching the
+        /// marker string inside this very test.
+        fn production_part(src: &str) -> &str {
+            match src.rfind("\nmod tests {") {
+                Some(idx) => &src[..idx],
+                None => src,
+            }
+        }
+
+        // (a) The definition must exist exactly once across production files.
+        let mut def_total = 0usize;
+        let mut def_files: Vec<&str> = Vec::new();
+        for (name, src) in files {
+            let n = production_part(src).matches("pub fn node_shape(").count();
+            if n > 0 {
+                def_total += n;
+                def_files.push(name);
+            }
+        }
+        assert!(
+            def_total == 1,
+            "expected exactly 1 `pub fn node_shape(` definition across production files, found {def_total} in {def_files:?}"
+        );
+
+        // (b) Exactly 2 production call sites: one in detector.rs (DSP loop),
+        // one in gui.rs (shape-curve loop). Excludes the definition itself,
+        // the `use ... node_shape;` import, `super::node_shape` test callers,
+        // test-module lines (stripped above), and `//` comments.
+        let mut total_calls = 0usize;
+        let mut per_file: Vec<(&str, usize)> = Vec::new();
+        for (name, src) in files {
+            let mut count = 0usize;
+            for line in production_part(src).lines() {
+                let code = match line.find("//") {
+                    Some(idx) => &line[..idx],
+                    None => line,
+                };
+                if code.contains("pub fn node_shape(") {
+                    continue;
+                }
+                if code.contains("use ") && code.contains("node_shape") {
+                    continue;
+                }
+                if code.contains("super::node_shape") {
+                    continue;
+                }
+                count += code.matches("node_shape(").count();
+            }
+            per_file.push((name, count));
+            total_calls += count;
+        }
+        let calls_in = |f: &str| -> usize {
+            per_file.iter().find(|(n, _)| *n == f).map(|(_, c)| *c).unwrap_or(0)
+        };
+        assert!(
+            total_calls == 2 && calls_in("src/dsp/detector.rs") == 1 && calls_in("src/gui.rs") == 1,
+            "expected exactly 2 production `node_shape(` call sites (1 in src/dsp/detector.rs, 1 in src/gui.rs); a third production caller may have appeared. per-file counts: {per_file:?}"
+        );
+        // Name the offender explicitly if some other file gained a caller.
+        for (name, count) in &per_file {
+            if *name != "src/dsp/detector.rs" && *name != "src/gui.rs" {
+                assert!(
+                    *count == 0,
+                    "third production caller of `node_shape` detected in offending file: {name} ({count} call site(s)); per-file counts: {per_file:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn gui_curve_matches_dsp_region_depth_bit_identical() {
+        // Fixed node params exercising bells, both shelf kinds, and mixed
+        // enabled/disabled slots — the same shapes the DSP loop and the GUI
+        // loop both feed into the shared `node_shape` single source of truth.
+        let nf = [200.0, 2000.0, 12000.0, 500.0, 1000.0, 4000.0, 8000.0, 16000.0];
+        let nd = [0.2, 0.9, 0.1, 0.7, 0.4, 1.0, 0.0, 0.5];
+        let nsh = [1, 0, 2, 0, 1, 2, 0, 0];
+        let nen = [true, true, true, false, true, false, true, false];
+        // Sample freqs spanning below/above anchors and shelf regions.
+        let freqs = [50.0f32, 200.0, 1000.0, 2000.0, 8000.0, 18000.0];
+        // Precomputed pin table: (freq, expected value, expected f32 bits).
+        // Generated from the first run of this test (see PIN lines with
+        // `-- --nocapture`); exact `==`/bits equality catches any silent
+        // signature or math change in `node_shape`.
+        const EXPECTED: [(f32, f32, u32); 6] = [
+            (50.0, 0.3000002, 0x3E9999A0),
+            (200.0, 0.30120212, 0x3E9A372A),
+            (1000.0, 0.5688666, 0x3F11A13E),
+            (2000.0, 0.6438931, 0x3F24D62E),
+            (8000.0, 0.10583202, 0x3DD8BE75),
+            (18000.0, 0.07013579, 0x3D8FA35A),
+        ];
+        for (i, f) in freqs.iter().enumerate() {
+            // Same args the DSP loop and GUI loop use: repeated calls must be
+            // exactly (bit-)identical, not merely approximate.
+            let dsp = super::node_shape(*f, &nf, &nd, &nsh, &nen);
+            let gui = super::node_shape(*f, &nf, &nd, &nsh, &nen);
+            assert!(
+                dsp == gui,
+                "DSP and GUI region depth must be bit-identical at {f} Hz: dsp={dsp:?} gui={gui:?}"
+            );
+            assert!(dsp.is_finite(), "region depth must be finite at {f} Hz, got {dsp:?}");
+            let (exp_freq, exp_val, exp_bits) = EXPECTED[i];
+            assert!(
+                *f == exp_freq,
+                "pin table order drifted: freqs[{i}] = {f}, table has {exp_freq}"
+            );
+            assert!(
+                dsp == exp_val,
+                "bit-identity pin failed at {f} Hz: got {dsp:?}, table has {exp_val:?} (math or signature changed?)"
+            );
+            assert!(
+                dsp.to_bits() == exp_bits,
+                "bit-pattern pin failed at {f} Hz: got 0x{:08X}, table has 0x{exp_bits:08X}",
+                dsp.to_bits()
+            );
+            println!("PIN node_shape({f}) = {dsp:?} bits=0x{:08X}", dsp.to_bits());
+        }
     }
 }

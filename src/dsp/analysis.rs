@@ -44,6 +44,7 @@ pub struct AnalysisFrame {
     /// Per-band input spectrum level in dB.
     pub spectrum: [f32; BANDS],
     /// Per-band linear gain applied by the suppressor (<= 1.0).
+    /// This is the detector follower output (`smoothed_gain` in depth CSV).
     pub reduction: [f32; BANDS],
     /// Band center frequencies in Hz (cached from the band layout).
     pub centers: [f32; BANDS],
@@ -51,6 +52,57 @@ pub struct AnalysisFrame {
     pub concentration: [f32; BANDS],
     /// Current sample rate.
     pub sample_rate: f32,
+    /// Monotonic analysis-frame counter (wrapping). Stamped by
+    /// `ResonanceSuppressor` once per pushed frame; lets a test CSV join
+    /// one row per (frame, band) without relying on GUI `debug_hop`.
+    pub frame_idx: u32,
+    /// Gain-reduction depth chain diagnostics (fixed-size, Copy).
+    /// Populated on the audio thread with plain float stores only —
+    /// no allocation, no String/Vec/file I/O. The CSV rendering below
+    /// is `#[cfg(test)]` (test/GUI thread only), never on audio thread.
+    /// `effective_depth` = p.depth * region_depth (detector L311).
+    pub effective_depth: [f32; BANDS],
+    /// `reduction_db` = knee_reduction_db output clamped to 36 dB (detector L313).
+    pub reduction_db: [f32; BANDS],
+    /// `target_gain` = 10^(-reduction_db/20), pre-follower (detector L314).
+    pub target_gain: [f32; BANDS],
+    /// `gain_db` = 20*log10(max(smoothed_gain,1e-4)) (filters L254).
+    pub gain_db: [f32; BANDS],
+    /// `effective_q` = clamp(layout.q * q_mult) (filters L255-257).
+    pub effective_q: [f32; BANDS],
+}
+
+/// Depth-chain CSV header: one row per (frame, band).
+/// `smoothed_gain` is `AnalysisFrame.reduction` (post-follower linear gain).
+#[cfg(test)]
+pub const DEPTH_CSV_HEADER: &str =
+    "frame_idx,band,effective_depth,reduction_db,target_gain,smoothed_gain,gain_db,effective_q";
+
+/// Render depth-chain frames as CSV text. Test/GUI thread only — allocates
+/// `String`, so never call on the audio thread. Compiled under `#[cfg(test)]`
+/// to keep the audio-thread build free of String/Vec/file IO.
+#[cfg(test)]
+pub fn format_depth_csv(frames: &[AnalysisFrame]) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::from(DEPTH_CSV_HEADER);
+    out.push('\n');
+    for f in frames {
+        for b in 0..BANDS {
+            let _ = write!(
+                out,
+                "{},{},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6}\n",
+                f.frame_idx,
+                b,
+                f.effective_depth[b],
+                f.reduction_db[b],
+                f.target_gain[b],
+                f.reduction[b],
+                f.gain_db[b],
+                f.effective_q[b],
+            );
+        }
+    }
+    out
 }
 
 /// Preallocated analysis engine for one FFT size.
@@ -289,7 +341,7 @@ mod tests {
         // a pure tone - the mid-range the recalibration was designed for.
         let sr = 44100.0;
         let fft = 2048;
-        let mut eng = AnalysisEngine::new(fft, sr);
+        let eng = AnalysisEngine::new(fft, sr);
         let centers = eng.bands().centers;
         let target = 40;
         let f0 = centers[target];
